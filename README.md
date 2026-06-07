@@ -28,7 +28,32 @@
 
   - pinocchio
 
+### Build and source the workspace:
+
+```Python
+colcon build
+source install/setup.bash
+```
+
 ### Tutorial：
+
+- To display the robot model in RViz:
+
+  ```Python
+  
+  ```
+
+- To display the robot model in Mujoco:
+
+  ```Python
+  
+  ```
+
+
+
+## 参考项目：
+
+- [URDF](https://github.com/agilexrobotics/agx_arm_urdf)
 
 - 
 
