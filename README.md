@@ -26,7 +26,7 @@
 
     - **Python**: 3\.10
 
-    - **Simulation**: Mujoco 3\.x
+    - **Simulation**: Mujoco 3\.3\.7
 
     - **Motion Planning**: Moveit2
 
