@@ -1,10 +1,10 @@
 # ros2\_control\_6\_dof\_arm\_rcm\_control
 
-- 本项目旨在基于 `ros2_control` 框架，为六轴机械臂（如 AgileX 系列）开发并实现具备柔顺交互能力的 RCM（Remote Center of Motion，远程运动中心）控制算法
+- 本项目旨在为六轴机械臂（如 AgileX 系列）开发并实现具备柔顺交互能力的 RCM（Remote Center of Motion，远程运动中心）控制
 
 # 📝 项目介绍
 
-- **核心目标**：基于 `ros2_control` 硬件抽象层开发，实现高实时性的 RCM 约束控制算法；
+- **核心目标**：实现 RCM 约束控制算法；
 
 - **拖动示教与标定（重力补偿）**：引入重力补偿模式，精准抵消机械臂自重。允许用户通过直接拖动机械臂，在物理空间中直观、无阻力地进行不动点（RCM约束点）的末端坐标标记；
 
@@ -27,8 +27,6 @@
     - **Python**: 3\.10
 
     - **Simulation**: Mujoco 3\.3\.7
-
-    - **Motion Planning**: Moveit2
 
     - **Dynamics Library**: Pinocchio
 
