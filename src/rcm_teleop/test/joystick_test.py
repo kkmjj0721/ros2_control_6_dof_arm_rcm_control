@@ -3,6 +3,7 @@ import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Joy
 
+
 class GamepadController(Node):
     def __init__(self):
         super().__init__('gamepad_controller')
@@ -17,6 +18,7 @@ class GamepadController(Node):
     def joy_callback(self, msg):
         self.get_logger().info(f'收到手柄数据 -> 摇杆: {msg.axes}, 按键: {msg.buttons}')
 
+
 def main(args=None):
     rclpy.init(args=args)
     node = GamepadController()
@@ -27,6 +29,7 @@ def main(args=None):
     finally:
         node.destroy_node()
         rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()

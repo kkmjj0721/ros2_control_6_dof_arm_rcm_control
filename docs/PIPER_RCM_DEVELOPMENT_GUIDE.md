@@ -1,245 +1,197 @@
-# Piper RCM、松灵 Piper SDK 与安全开发中文指南（CURRENT / PLANNED / RESEARCH）
+# Piper 六轴机械臂 RCM 控制项目实施手册
+
+- **状态**：中文重构版
+- **日期**：2026-08-09
+- **适用仓库**：`ros2_control_6_dof_arm_rcm_control`
+- **改动范围**：本文只描述文档、接口、功能包搭建、RCM 原理和验收流程；不代表本文中的 `PLANNED` 代码已经在仓库中实现。
+- **执行原则**：从上到下做。先模型和接口，再 RCM 数学，再 mock/sim，最后只读真机和低能量真机。
+
+---
+
+## 目录
+
+- [0. 项目目标、架构和安全边界](#0-项目目标架构和安全边界)
+- [1. 开始前：环境、仓库基线和当前可运行内容](#1-开始前环境仓库基线和当前可运行内容)
+- [2. 功能包：`agx_arm_description`](#2-功能包agx_arm_description)
+- [3. 功能包：`rcm_teleop`](#3-功能包rcm_teleop)
+- [4. 功能包：`rcm_msgs`](#4-功能包rcm_msgs)
+- [5. RCM 纯理论：远心点约束、工具轴线和求解器](#5-rcm-纯理论远心点约束工具轴线和求解器)
+- [6. 功能包：`agx_arm_controller`](#6-功能包agx_arm_controller)
+- [7. 功能包：`agx_arm_moveit_config`](#7-功能包agx_arm_moveit_config)
+- [8. 功能包：`agx_arm_sim`](#8-功能包agx_arm_sim)
+- [9. 功能包：`agx_arm_hw_interface`](#9-功能包agx_arm_hw_interface)
+- [10. 功能包：`agx_arm_bringup`](#10-功能包agx_arm_bringup)
+- [11. 从 mock 到真机的逐步验收](#11-从-mock-到真机的逐步验收)
+- [12. 故障处理、接口契约和文档维护](#12-故障处理接口契约和文档维护)
+- [附录 A：命令速查](#附录-a命令速查)
+- [附录 B：功能包状态表](#附录-b功能包状态表)
+- [附录 C：术语和禁止事项](#附录-c术语和禁止事项)
 
-## 中文阅读入口 / 中文版本说明 / 松灵 SDK 使用总览
+---
+
+## 0. 项目目标、架构和安全边界
+
+本项目的目标是把 Piper 六轴机械臂接入 ROS 2 工作区，逐步形成一条可验证、可回放、可停机的 RCM 控制链路。文档按真实开发顺序组织：先把机器人模型和输入链路做清楚，再定义消息接口，再理解 RCM 约束，再写 C++ 控制器，然后进入仿真、只读硬件、低能量真机和验收。
+
+### 0.1 最终系统链路
 
-本文是本仓库的中文版本开发指南。少量英文仅保留为 ROS、API、package、topic、command、SDK 函数名、代码符号或状态机器标签；阅读时应以中文入口、中文安全边界和中文 SDK 补充章节为准。此前读者反馈的“乱码”主要不是字符编码错误，而是历史英文段落、英文 only 标题和 API 名混在中文工作流里导致不易阅读；本文件后续维护应优先补中文说明，再保留必要英文符号。
+推荐最终链路如下：
 
-状态标签中文名如下：当前可用（CURRENT）表示当前仓库已经具备可验证文件或 dry-run 行为；计划实现（PLANNED）表示还需要新增源码、launch、测试、审查和硬件门控；研究验证（RESEARCH）表示只能做概念、数学、仿真、证据设计或只读验证，不能对真实机械臂发控制命令。
+```text
+操作者 / 手柄 / 上层任务 / 视觉目标
+  -> RCMCommand 或上层 intent
+  -> SafetySupervisor / 状态机 / watchdog
+  -> RCMController C++ 控制器
+  -> ros2_control controller 或 command owner
+  -> Piper SDK / CAN hardware adapter
+  -> 真实 Piper 机械臂
+  -> joint feedback / diagnostics / rosbag evidence
+```
 
-当前仓库没有集成 `piper_sdk`，没有 SDK adapter，没有 CAN adapter，也没有 live arm 写控制链路。本文中所有松灵 / AgileX Piper SDK 内容均是 PLANNED/RESEARCH 操作流程、证据清单和安全约束，不是当前仓库的实机控制教程；H0-H6 通过前只允许安装核对、版本记录、SocketCAN 只读检查、SDK 只读状态读取设计和 adapter 边界设计。
+这条链路的核心是“输入意图”和“硬件写命令”必须分开：
 
-如何使用这份文档：新手先读本入口、第 0 章范围与安全契约、第 1 章当前仓库地图、第 2 章当前可安全运行命令和第 3 章状态标签；做 SDK/CAN 的读者先读第 5-6 章和文末“松灵 / AgileX Piper SDK 详细使用补充（中文）”；做 RCM、重力补偿或仿真的读者先读第 12-16 章，并始终按 H0-H6 门控和只读优先原则执行。
+- `rcm_teleop` 只表达操作者意图，不接触 SDK/CAN 写接口。
+- `rcm_msgs` 固化跨包接口，避免用普通 `Vector3` 长期承载安全语义。
+- `agx_arm_controller` 负责 RCM 几何、雅可比、求解器、状态机和状态发布。
+- `agx_arm_hw_interface` 是唯一接触 Piper SDK/CAN 的硬件边界。
+- `agx_arm_bringup` 只组合 launch 和参数，不写控制算法。
+- MoveIt 2、MuJoCo、RViz、rosbag 都是辅助工具，不能成为真机 command owner。
 
-> 中文版本说明：本文档使用 UTF-8 编写。当前检查未发现典型编码乱码；此前“不顺/像乱码”的主要原因是英文标题和英文正文过多。本版将主标题、目录式章节标题、操作说明、安全边界和 SDK 说明改为中文，必要英文术语仅作为机器标签或 API 名保留。
+### 0.2 当前仓库事实和规划包
 
-## 0. 范围与安全契约
+当前仓库已经存在以下 ROS 2 package：
 
-本文档是当前仓库的操作与二次开发指南。
+```text
+src/
+├── rcm_teleop/
+├── agx_arm_description/
+├── agx_arm_controller/
+└── agx_arm_bringup/
+```
 
-它把已经能从仓库文件中验证的行为、计划中的工程工作、以及只允许研究验证的控制概念分开。
+后续建议新增或完善：
 
-三个机器标签必须严格使用：
+```text
+src/
+├── rcm_msgs/                  # PLANNED：RCM 强类型消息、状态、reason code
+├── agx_arm_moveit_config/     # PLANNED：MoveIt 2 配置和 fake execution
+├── agx_arm_sim/               # PLANNED：MuJoCo / replay / sim namespace
+└── agx_arm_hw_interface/      # PLANNED：Piper SDK/CAN 只读适配和 command owner
+scripts/                       # PLANNED：CAN、SDK 只读检查、证据收集脚本
+```
 
-- `CURRENT`：当前仓库已经包含足够的源码、launch、模型或测试资产，可以按文档描述执行或观察。
-- `PLANNED`：文档描述的是未来实现路径、接口约束或脚手架，当前仓库尚未实现完整功能。
-- `RESEARCH`：该内容只能用于概念、数学、仿真或证据规划，未获准对真实机械臂发控制命令。
+本文使用三个状态标签：
 
-本文档中的 `CURRENT` 范围刻意收窄。
+| 标签 | 含义 | 写入条件 |
+| --- | --- | --- |
+| `CURRENT` | 当前仓库中已经存在，并且可以静态检查或运行 | 有路径、命令、输出或测试证据 |
+| `PLANNED` | 建议实现，但当前不能当作已完成能力 | 有接口草案、目录建议、验收条件 |
+| `RESEARCH` | 理论、算法、仿真或安全研究内容 | 有公式、风险说明、实验要求 |
 
-`CURRENT` 包含 ROS 2 workspace 目录结构。
+不能因为目录存在就声明功能可用；也不能因为文档里有代码片段就认为仓库已经实现。所有 `PLANNED` 内容都需要后续提交源码、配置、launch、测试和验收证据。
 
-`CURRENT` 包含 `joystick` 包。
+### 0.3 技术路线：ROS 2 + C++ 核心 + Python 工具
 
-`CURRENT` 包含源码中的 Python 节点 `gamepad_controller`。
+本项目不建议做成纯 Python 单体程序，也不建议做成纯 C++ 单体程序。推荐路线是：
 
-`CURRENT` 包含一个 launch 文件，它启动标准 `joy_node` 和自定义手柄可执行文件。
+- ROS 2 负责通信、参数、launch、TF、RViz、rosbag、MoveIt 2、diagnostics、ros2_control 接入。
+- C++ 负责实时性和安全风险高的链路，例如 RCM 控制器、求解器、状态机、hardware interface、command owner、高频 sim bridge。
+- Python 负责输入 dry-run、标定脚本、日志分析、只读 probe、运维脚本和离线数学验证。
 
-`CURRENT` 在根命名空间下包含 `/joy`、`/rcm_mode`、`/rcm_cmd` 这些上层话题流。
+语言选择建议：
 
-`CURRENT` 包含 `src/agx_arm_description` 下的 Piper URDF 与 mesh 资产。
+| 模块 | 推荐技术 | 原因 |
+| --- | --- | --- |
+| `rcm_teleop` 当前 dry-run | Python / `rclpy` | 人机输入低频，便于调试，不直接写硬件 |
+| `rcm_msgs` | ROS 2 IDL / `ament_cmake` | C++ 和 Python 都可生成接口 |
+| `agx_arm_controller` | C++ / `rclcpp` / Eigen | 控制周期、矩阵计算、异常路径更可控 |
+| `agx_arm_hw_interface` | C++ 优先 | SDK/CAN、watchdog、command owner 必须 fail-closed |
+| `agx_arm_bringup` | Python launch | 只组合节点和参数，不做实时控制 |
+| `agx_arm_moveit_config` | 配置为主，C++ 插件按需 | MoveIt 规划不是 RCM 闭环本体 |
+| `agx_arm_sim` | C++/Python 分工 | 高频同步用 C++，离线 replay/画图用 Python |
+| `scripts/` | bash/Python | 一次性只读工具，不承担持续控制 |
 
-`CURRENT` 包含 bringup 与 controller 的空壳包，便于后续扩展。
+判断准则：需要稳定周期、低延迟、硬件写控制、watchdog、限幅和状态机的部分，优先用 C++；需要快速验证、离线分析、一次性检查的部分，保留 Python 更合适。
 
-`CURRENT` 不包含 Piper 实机硬件驱动。
+### 0.4 控制权和安全边界
 
-`CURRENT` 不包含 `piper_sdk` 集成代码。
+真实机械臂写控制必须坚持 single command owner：
 
-`CURRENT` 不包含 SDK adapter。
+```text
+同一时刻只能有一个节点拥有真实硬件写命令权。
+```
 
-`CURRENT` 不包含 CAN adapter。
+禁止多个节点同时 import SDK 或同时发布真实写命令。允许多个节点产生目标、建议、规划或仿真状态，但最终写硬件的节点必须唯一，并且受状态机、watchdog、timestamp、operator enable、joint limit 和 fault latch 管控。
 
-`CURRENT` 不包含 `ros2_control` hardware interface。
+写控制前必须满足：
 
-`CURRENT` 不包含 `joint_trajectory_controller` wiring。
+- joint name、joint order、方向、单位、零位、限位已经核对。
+- RCM 工具轴线、有效直杆段、tool ID、calibration version 已冻结。
+- `RCMCommand` 或等价命令带 timestamp、有效期、enable、speed scale、tool/calibration 字段。
+- command owner 默认关闭，必须显式授权才允许写控制。
+- SDK/CAN error、feedback timeout、watchdog timeout、solver infeasible 都能进入 `HOLD` 或 `FAULT`。
 
-`CURRENT` 不包含 MoveIt 配置包。
+---
 
-`CURRENT` 不包含 MuJoCo runtime bridge。
+## 1. 开始前：环境、仓库基线和当前可运行内容
 
-`CURRENT` 不包含经过验证的 RCM solver。
+本章只确认当前仓库事实，不启动真机，不发送硬件命令。后续所有功能包都应在本章能稳定执行的基础上继续做。
 
-`CURRENT` 不包含真实机械臂上的重力补偿控制。
+### 1.1 环境准备
 
-`CURRENT` 不包含 torque、impedance、current、gain-level 或 MIT mode 的 live control。
-
-`PLANNED` 内容是路线图、接口约束和实现脚手架。
-
-`PLANNED` 示例必须先落入源码、经过代码审查、测试和硬件门控，才允许用于真实硬件。
-
-`RESEARCH` 内容只能用于概念、数学推导、仿真和证据设计。
-
-任何 `RESEARCH` 控制模式在 H0-H9 硬件门控通过前，不得发送到 live arm。
-
-本文中的 live arm 指已上电、连接 CAN、Ethernet、USB-CAN 或厂商传输链路的真实机械臂。
-
-本文中的 dry run 指 ROS 节点、mock interface、静态模型、仿真或只读工具，不包含 actuator command。
-
-本文中的 evidence package 指用于审查的日志、照片、版本、哈希、测试输出和操作者记录。
-
-任何标为 `PLANNED 示例` 的代码块都不能直接复制到上电机械臂环境运行。
-
-任何 joystick intent 都不能直接接入厂商写控制命令。
-
-`GRAVITY_COMP` 只是当前手柄节点发布的字符串标签，不代表已经实现重力补偿。
-
-`IMPEDANCE` 只是当前手柄节点发布的字符串标签，不代表已经实现阻抗控制。
-
-`RCM_CONTROL` 只是当前手柄节点发布的字符串标签，不代表已经实现 RCM 运动学约束。
-
-当前手柄节点只发布“意图型”消息。
-
-当前手柄节点不拥有硬件安全职责。
-
-当前手柄节点不发布 joint trajectory。
-
-当前手柄节点不发布 wrench command。
-
-当前手柄节点不发布 motor current。
-
-当前手柄节点不发布 torque command。
-
-当前手柄节点不验证真实工具轴。
-
-当前手柄节点不知道已校准的 RCM 点。
-
-当前手柄节点不知道已校准的 TCP。
-
-当前手柄节点不执行 workspace limit。
-
-当前手柄节点不执行 collision limit。
-
-当前手柄节点没有足够的 deadman 语义，不能作为实机使能条件。
-
-任何真实硬件命令链路都必须从只读通信检查开始。
-
-任何写控制链路都必须由安全、数学、测试、构建/部署责任人分别审查。
-
-## 1. 当前仓库地图（CURRENT）
-
-仓库根目录按 ROS 2 colcon workspace 使用。
-
-当前顶层 ROS 包位于 `src` 下。
-
-`src/joystick` 是当前唯一具备用户可运行行为的 ROS 包。
-
-`src/agx_arm_description` 包含 Piper URDF 与 mesh 资产。
-
-`src/agx_arm_bringup` 当前存在，但还没有真实 bringup pipeline。
-
-`src/agx_arm_controller` 当前存在，但还没有 RCM controller。
-
-`joystick` 包使用 `ament_cmake`，但安装的是 Python 可执行节点。
-
-`joystick` 包声明了 `rclpy` 与 `sensor_msgs` 依赖。
-
-手柄 Python 代码还导入了 `std_msgs.msg.String` 与 `geometry_msgs.msg.Vector3`。
-
-手柄 launch 文件启动标准 `joy` 包节点。
-
-手柄 launch 文件启动自定义可执行文件 `joystick.py`。
-
-launch 时节点名当前可能显示为 `rcm_gamepad_controller`。
-
-Python 源码级默认节点名是 `gamepad_controller`。
-
-做接口讨论时，以 `gamepad_controller` 作为当前自定义节点契约。
-
-当前 `/joy` 输入类型是 `sensor_msgs/msg/Joy`。
-
-当前 `/rcm_mode` 输出类型是 `std_msgs/msg/String`。
-
-当前 `/rcm_cmd` 输出类型是 `geometry_msgs/msg/Vector3`。
-
-`/rcm_cmd.x` 是累计的 pitch intent。
-
-`/rcm_cmd.y` 是累计的 yaw intent。
-
-`/rcm_cmd.z` 是累计的 insertion intent。
-
-当前 command units 只是手柄累计意图单位，不是已验证的机器人 SI 单位。
-
-当前按钮映射为 A index 0、B index 1、X index 3、Y index 4。
-
-X 按钮把 mode label 切到 `GRAVITY_COMP`。
-
-Y 按钮把 mode label 切到 `IMPEDANCE`。
-
-B 按钮把 mode label 切到 `RCM_CONTROL`。
-
-A 按钮把累计 command value 清零。
-
-默认手柄节点参数 `deadzone` 是 `0.15`。
-
-默认手柄节点参数 `pitch_step` 是 `0.02`。
-
-默认手柄节点参数 `yaw_step` 是 `0.02`。
-
-默认手柄节点参数 `insertion_step` 是 `0.005`。
-
-launch 文件把 `joy_node` deadzone 设为 `0.1`。
-
-launch 文件把 `joy_node` autorepeat rate 设为 `20.0` Hz。
-
-launch 文件把自定义节点 deadzone 设为 `0.15`。
-
-launch 文件把自定义节点 pitch step 设为 `0.02`。
-
-launch 文件把自定义节点 yaw step 设为 `0.02`。
-
-launch 文件把自定义节点 insertion step 设为 `0.005`。
-
-URDF robot name 是 `piper`。
-
-URDF 包含 fixed `world` 到 `base_link` joint。
-
-URDF 包含 `joint1` 到 `joint6` 六个 revolute joints。
-
-当前运动链末端 link 是 `link6`。
-
-mesh 资产包含 STL 和 DAE 文件。
-
-RViz 前应检查 URDF 中 mesh 路径是否仍符合当前 package 路径约定。
-
-## 2. 当前可安全运行的命令（CURRENT）
-
-下面命令只用于仓库级开发、构建、测试和话题观察。
-
-这些命令本身不会向真实机械臂发送运动命令。
-
-从 workspace 根目录运行。
-
-使用已经 source ROS 2 Humble 的终端。
-
-Ubuntu 22.04 + Humble 环境中，先 source `/opt/ros/humble/setup.bash`。
-
-CURRENT 安全构建与测试命令如下。
+建议以 ROS 2 Humble 为基线：
 
 ```bash
 source /opt/ros/humble/setup.bash
 colcon build --symlink-install
 source install/setup.bash
-colcon test --event-handlers console_direct+
-colcon test-result --verbose
 ```
 
-上面命令只验证当前 workspace 能否构建和运行已有测试。
+如果构建失败，先不要新增功能包。按以下顺序排查：
 
-它不能证明 Piper 实机可控。
+1. `source /opt/ros/humble/setup.bash` 是否执行。
+2. `colcon` 是否安装。
+3. `src/*/package.xml` 中依赖是否缺失。
+4. 当前工作区是否有未提交的大规模移动、删除或 mesh 路径变化。
+5. `build/`、`install/`、`log/` 是否来自旧环境；必要时清理这些生成目录后重建。
 
-CURRENT 手柄 dry run launch 命令如下。
+### 1.2 当前包基线检查
+
+列出当前 package：
+
+```bash
+find src -maxdepth 2 -name package.xml -print
+```
+
+应能看到：
+
+```text
+src/rcm_teleop/package.xml
+src/agx_arm_description/package.xml
+src/agx_arm_controller/package.xml
+src/agx_arm_bringup/package.xml
+```
+
+单独构建当前可运行输入包：
+
+```bash
+colcon build --packages-select rcm_teleop --symlink-install
+source install/setup.bash
+ros2 pkg executables rcm_teleop
+```
+
+### 1.3 当前 `rcm_teleop` dry-run 验收
+
+当前仓库真正可优先验证的是手柄 dry-run 链路：
 
 ```bash
 source /opt/ros/humble/setup.bash
-colcon build --symlink-install --packages-select joystick
+colcon build --packages-select rcm_teleop --symlink-install
 source install/setup.bash
-ros2 launch joystick joystick.launch.py
+ros2 launch rcm_teleop rcm_teleop.launch.py
 ```
 
-上面命令启动手柄输入和意图输出。
-
-它不能作为硬件 enable 条件。
-
-CURRENT 话题检查命令如下。
+另开终端观察：
 
 ```bash
 source install/setup.bash
@@ -247,2528 +199,2575 @@ ros2 topic list
 ros2 topic echo /joy
 ros2 topic echo /rcm_mode
 ros2 topic echo /rcm_cmd
-ros2 topic hz /joy
-ros2 topic hz /rcm_cmd
 ```
 
-这些命令只观察 ROS topic。
+通过标准：
 
-看见 `/rcm_cmd` 不代表可以接 SDK 写控制。
+- launch 能启动，不报找不到 package 或 executable。
+- `/joy` 有手柄输入。
+- `/rcm_mode` 能随按钮变化。
+- `/rcm_cmd` 能随摇杆或按键产生 dry-run intent。
 
-CURRENT 接口类型检查命令如下。
+这一步只证明输入链路可用，不证明 RCM 控制、MoveIt、MuJoCo、SDK、CAN 或真机控制可用。
+
+### 1.4 建议的实际推进顺序
+
+从这里开始按顺序做，不要跳到真机写控制：
+
+```text
+1. 补齐 agx_arm_description：模型、mesh、TF、显示 launch
+2. 整理 rcm_teleop：保留 dry-run，明确 deadman、mode、intent
+3. 新增 rcm_msgs：冻结 RCMCommand / RCMStatus / reason code
+4. 学清 RCM 理论：工具轴线、RCM 点、残差、雅可比、求解器
+5. 实现 agx_arm_controller：先 C++ 数学库，再 ROS wrapper，再状态机
+6. 新增 agx_arm_moveit_config：只做 fake plan / approach / retract
+7. 新增 agx_arm_sim：只读 replay / MuJoCo / sim namespace
+8. 新增 agx_arm_hw_interface：先 CAN/SDK 只读，再 command owner
+9. 完善 agx_arm_bringup：按 display、dry-run、mock、sim、readonly、live_low_energy 分开 launch
+10. 按 H0-H9 验收进入低能量真机；启用重力补偿前必须额外通过 H8.5
+```
+
+这个顺序的原因很简单：RCM 控制依赖几何，几何依赖 description；控制器依赖强类型消息；真机写控制依赖只读反馈和 command owner；所有 live 操作都依赖前面的证据。
+
+---
+
+## 2. 功能包：`agx_arm_description`
+
+### 2.1 作用和边界
+
+`agx_arm_description` 是模型包，负责 URDF/Xacro、mesh、joint、link、TF、工具 frame、RViz 显示资源和后续 MoveIt/MuJoCo 的几何基础。
+
+它应该放：
+
+| 内容 | 说明 |
+| --- | --- |
+| URDF/Xacro | 六轴机械臂 link、joint、limit、inertial、visual、collision |
+| mesh | STL/DAE 或其他模型文件，路径必须可安装和可解析 |
+| tool frames | `tool_mount`、`tool_axis`、`tool_tip`、`tool_collision` |
+| display launch | 只启动模型显示、TF、RViz，不接硬件 |
+| RViz 配置 | 模型显示、TF tree、joint state 可视化 |
+| 模型测试 | URDF 解析、mesh 路径、joint name、关键 frame 检查 |
+
+它不应该放：
+
+- SDK/CAN 代码。
+- RCM solver。
+- rcm_teleop 输入解析。
+- command owner。
+- 真机写控制 launch。
+
+### 2.2 当前状态
+
+当前仓库已经有 `src/agx_arm_description`，但需要继续确认资源安装、display launch、RViz 配置和工具 frame 是否完整。description 包必须先稳定，因为后续 RCM 理论和 controller 都引用同一套 joint name、frame name 和 tool axis。
+
+检查当前文件：
 
 ```bash
-ros2 interface show sensor_msgs/msg/Joy
-ros2 interface show std_msgs/msg/String
-ros2 interface show geometry_msgs/msg/Vector3
+find src/agx_arm_description -maxdepth 4 -type f | sort
 ```
 
-这些命令确认 message shape。
+重点看：
 
-它们不验证单位、关节顺序、工具坐标或安全状态。
+- `package.xml` 是否声明模型显示运行依赖。
+- `CMakeLists.txt` 是否安装 URDF、mesh、launch、rviz/config。
+- URDF 中 mesh 是否使用 `package://` 路径。
+- 是否存在绝对路径，例如 `/home/.../mesh.stl`。
+- `joint1` 到 `joint6` 名称、顺序、方向是否和 SDK/厂商资料可对应。
 
-CURRENT 手柄参数检查命令如下。
+### 2.3 一步步补齐模型显示
 
-```bash
-ros2 param list
-ros2 param get /rcm_gamepad_controller deadzone
-ros2 param get /rcm_gamepad_controller pitch_step
-ros2 param get /rcm_gamepad_controller yaw_step
-ros2 param get /rcm_gamepad_controller insertion_step
+第 1 步：补资源安装规则。
+
+```cmake
+# PLANNED：示例安装规则。实际目录名以仓库为准。
+install(DIRECTORY urdf
+  DESTINATION share/${PROJECT_NAME}
+)
+
+install(DIRECTORY launch
+  DESTINATION share/${PROJECT_NAME}
+)
+
+install(DIRECTORY rviz config
+  DESTINATION share/${PROJECT_NAME}
+  OPTIONAL
+)
 ```
 
-如果 launch 后节点显示为 `/gamepad_controller`，则把上述节点名替换为 `/gamepad_controller`。
+第 2 步：新增或完善 `display_piper.launch.py`。
 
-不要从手柄 topic 测试成功推断硬件 ready。
-
-不要把手柄输出直接连接到厂商写控制命令。
-
-除非相关 H gate 已经通过，否则不要从本文档运行任何 CAN 写命令或 SDK 写命令。
-
-## 3. CURRENT / PLANNED / RESEARCH 标签含义
-
-`CURRENT` 用于当前仓库文件已经支撑的命令、观察或静态资产。
-
-`PLANNED` 用于未来源码实现、接口约束、测试策略或 launch 方案。
-
-`RESEARCH` 用于需要单独验证的控制模式、动力学、底层协议或数学方案。
-
-`CURRENT` 工作可以用 `colcon`、`ros2 launch`、`ros2 topic` 工具演示。
-
-`CURRENT` 工作可以包括 URDF 只读检查。
-
-`CURRENT` 工作可以包括 joystick message flow。
-
-`CURRENT` 工作可以包括静态文档审阅。
-
-`CURRENT` 工作可以包括 package discovery。
-
-`CURRENT` 工作可以包括不命令硬件的本地测试。
-
-`PLANNED` 工作必须进入受版本控制的源码后，才能称为已实现。
-
-`PLANNED` 工作必须包含 launch 文件、测试和安全检查后，才允许进入 live use。
-
-`PLANNED` 工作必须明确 command owner 与 command timeout。
-
-`PLANNED` 工作必须明确 mock 与 simulation 行为。
-
-`PLANNED` 工作必须包含 rollback 或 fail-closed 路径。
-
-`RESEARCH` 工作不得拥有 actuator。
-
-`RESEARCH` 工作不得绕过 ROS lifecycle state。
-
-`RESEARCH` 工作不得在没有书面验收标准时使用厂商 low-level motor control。
-
-`RESEARCH` 工作不得被隐藏在用户友好的 mode label 后面。
-
-在厂商文档、命令限制和 HIL 测试证明前，MIT mode 仍属于 `RESEARCH`。
-
-在厂商文档、命令限制和 HIL 测试证明前，torque command mode 仍属于 `RESEARCH`。
-
-在厂商文档、命令限制和 HIL 测试证明前，impedance command mode 仍属于 `RESEARCH`。
-
-在厂商文档、命令限制和 HIL 测试证明前，current command mode 仍属于 `RESEARCH`。
-
-在厂商文档、命令限制和 HIL 测试证明前，gain-level tuning 仍属于 `RESEARCH`。
-
-在厂商文档、命令限制和 HIL 测试证明前，low-level motor-control mode 仍属于 `RESEARCH`。
-
-“低层电机禁用”指 live hardware 上的 low-level motor-control 写路径保持关闭，直到厂商语义、命令限制和分级 HIL/live 证据通过审查。
-
-当前仓库可以用于开发控制栈。
-
-当前仓库不能证明临床安全。
-
-当前仓库不能证明 RCM 精度。
-
-当前仓库不能证明重力补偿稳定性。
-
-当前仓库不能证明关节力矩正确性。
-
-当前仓库不能证明 Piper CAN command 兼容性。
-
-当前仓库不能证明 MoveIt planning 正确性。
-
-当前仓库不能证明 MuJoCo dynamic fidelity。
-
-## 4. 硬件到货与首次检查 SOP（PLANNED）
-
-本 SOP 从真实 Piper 或兼容机械臂到货时开始。
-
-开箱检查时不要给机器人上电。
-
-机械检查时不要连接 CAN。
-
-第一次电气 smoke test 时不要安装工具。
-
-机械臂 enable 前不要运行 joystick launch。
-
-每一步都要记录到 evidence package。
-
-### 4.1 开箱检查
-
-拍摄未开封包装。
-
-拍摄 shock indicator（如有）。
-
-拍摄标签、序列号和型号标识。
-
-拍摄附件、线缆、电源、USB-CAN adapter 和急停硬件。
-
-搬动机械臂前检查是否有松散零件。
-
-检查是否有漏油、变形、划伤、外壳裂纹、连接器弯曲或紧固件缺失。
-
-记录发货日期、收货日期和存放条件。
-
-记录 vendor、distributor、firmware claim 和随附文档版本。
-
-第一次上电区域保持清空。
-
-第一次上电至少指定一名 operator 和一名 observer。
-
-### 4.2 机械检查
-
-核对 base mounting hole 与工作台或 fixture。
-
-通电前确认 base 稳固。
-
-只有厂商手册允许时，才允许无电状态下移动关节。
-
-若关节卡滞、下坠或发出异常声音，立即停止。
-
-检查 link cover 与 cable route。
-
-检查 connector strain relief。
-
-检查 gripper 或 flange accessory 是否安装牢固。
-
-检查工作空间与桌面、屏幕、笔记本和人员位置的关系。
-
-标记物理 keep-out zone。
-
-只有不会卷入机械臂时，才允许放置 soft stop 或泡沫缓冲。
-
-移除工作区内松散工具。
-
-第一次验证不要安装尖锐、过重或手术器械形态的工具。
-
-### 4.3 急停检查
-
-识别厂商急停设备。
-
-确认 observer 可以够到急停按钮。
-
-确认急停按钮具备机械锁止。
-
-按厂商文档确认 reset procedure。
-
-在 ROS 控制未运行时确认断电行为。
-
-不要把软件 stop 当成唯一 stop path。
-
-不要用 joystick button 充当 emergency stop。
-
-把急停测试结果写入 evidence package。
-
-如果急停行为不明确，阻塞所有 powered development。
-
-### 4.4 电源与接地
-
-按厂商电源标签核对输入电压。
-
-按厂商要求核对电流能力。
-
-连接前确认接头极性。
-
-确认电源线有 strain relief。
-
-确认工作台插座接地。
-
-enable drive 前确认机械臂 base 已固定。
-
-实际可行时，靠近电源操作尽量单手完成，另一只手远离工作空间。
-
-上电时让急停保持可触达。
-
-上电过程中监听异常声音。
-
-留意过热或电气故障气味。
-
-出现非预期运动时立即断电。
-
-机械臂报告 uncontrolled error 时立即断电。
-
-### 4.5 工作空间与人员
-
-定义 operator 角色。
-
-定义 observer 角色。
-
-定义 log owner 角色。
-
-非必要人员离开 keep-out zone。
-
-保持明确的断电路径。
-
-笔记本放在机械臂运动扫掠范围外。
-
-CAN 和 USB 线缆不能进入 joint 或 link pinch point。
-
-固定或走线 CAN/USB，避免线缆拉动机械臂。
-
-只有确认机械臂不会落向 operator 时，才使用低桌面。
-
-优先使用 bolted fixture，不优先使用临时夹具。
-
-### 4.6 证据包
-
-证据包必须包含照片。
-
-证据包必须包含 robot serial。
-
-证据包必须包含 firmware version。
-
-证据包必须包含 vendor SDK version、commit 或 release。
-
-证据包必须包含精确 firmware、SDK release/commit 和 API revision 的兼容证据。
-
-证据包必须包含 OS version。
-
-证据包必须包含 ROS 2 version。
-
-证据包必须包含 CAN adapter model。
-
-证据包必须包含 kernel version。
-
-证据包必须包含 SocketCAN interface name。
-
-证据包必须包含 read-only CAN logs。
-
-证据包必须包含 build logs。
-
-证据包必须包含 test logs。
-
-证据包必须包含实际运行过的 exact commands。
-
-RViz 或 simulation 截图只能在对应功能实现后加入。
-
-证据包必须包含 blockers。
-
-## 5. PC、Ubuntu、ROS 2、CAN 与 SocketCAN SOP（PLANNED）
-
-默认目标基线是 Ubuntu 22.04 与 ROS 2 Humble，除非项目 owner 明确更改。
-
-桌面开发优先使用 x86_64。
-
-ARM64 部署必须先确认 dependency matrix。
-
-PCL、OpenCV、Eigen、Pinocchio 进入源码后，要记录版本、ABI 和安装来源。
-
-不要安装来源不明的 binary blob。
-
-ROS 依赖优先使用官方 ROS package repository。
-
-Piper SDK 与 CAN setup 必须以厂商文档为准。
-
-`piper_sdk` 只能在 version、branch/release、CAN transport 都记录后使用。
-
-### 5.1 OS 与 ROS 基线
-
-CURRENT host setup 检查命令如下。
-
-```bash
-lsb_release -a
-uname -a
-printenv ROS_DISTRO
-source /opt/ros/humble/setup.bash
-ros2 --version
-```
-
-这些命令只采集主机环境信息。
-
-它们不会触发机械臂运动。
-
-常见开发依赖安装命令如下。
-
-```bash
-sudo apt update
-sudo apt install -y build-essential cmake git python3-colcon-common-extensions
-sudo apt install -y ros-humble-desktop ros-humble-joy
-sudo apt install -y can-utils net-tools iproute2 ethtool
-sudo apt install -y libeigen3-dev libopencv-dev libpcl-dev
-```
-
-`can-utils` 用于 `candump` 等 CAN 诊断。
-
-`ethtool` 用于部分网卡/CAN 设备诊断。
-
-缺少 `ip` 命令时安装 `iproute2`。
-
-不要默认假设 Pinocchio 已安装。
-
-记录 Pinocchio 来自 apt、conda、source build 还是 robotpkg。
-
-### 5.2 用户权限
-
-CAN 和 serial adapter 经常需要 group permission。
-
-改权限前先检查当前用户组。
-
-udev 规则必须在读取 device ID 后再写。
-
-CURRENT 诊断命令如下。
-
-```bash
-id
-groups
-lsusb
-ip link show
-dmesg --ctime | tail -n 80
-```
-
-如果 CAN adapter 显示为 `can0`，先继续只读检查。
-
-如果 CAN adapter 显示为其他名字，记录准确 interface。
-
-如果没有任何 CAN adapter，停止 CAN validation。
-
-### 5.3 SocketCAN 只读准备
-
-下面命令会配置 SocketCAN interface。
-
-它们会影响主机网络接口状态。
-
-只使用厂商指定 bitrate。
-
-只读验证期间不要发送 CAN frame。
-
-示例只读 setup 如下。
-
-```bash
-sudo ip link set can0 down
-sudo ip link set can0 type can bitrate 1000000
-sudo ip link set can0 up
-ip -details link show can0
-```
-
-上面 bitrate 是示例值，必须按 Piper 当前手册或 SDK 文档确认。
-
-只读 CAN 观察命令如下。
-
-```bash
-candump -L can0
-```
-
-`candump` 只用于观察 traffic。
-
-H0-H6 前不要运行任何会写入 position、velocity、torque、current、mode、enable、zero 或 MIT 的 vendor demo。
-
-H0-H6 前不要运行 low-level motor-control 示例。
-
-如果 `candump` 看不到 frame，不一定是错误；有些机器人可能在被查询前保持 silent。
-
-如果厂商协议需要 request frame 才返回状态，该动作应视为写控制或主动总线交互，必须等待门控批准。
-
-### 5.4 CAN 证据检查表
-
-记录 `ip link show` 输出。
-
-记录 `ip -details link show can0` 输出。
-
-记录准确 bitrate。
-
-记录 adapter model。
-
-记录 kernel driver。
-
-记录 `candump -L can0` timestamp。
-
-记录 robot power 是否开启。
-
-记录 drive 是否 enable。
-
-记录 vendor SDK 是否正在运行。
-
-记录是否发送过任何 write command。
-
-H0-H6 阶段，write command 的期望答案是 no。
-
-## 6. 松灵 / AgileX Piper SDK 使用手册（PLANNED/RESEARCH）
-
-本节是 SDK 使用手册，不代表当前仓库已经集成 SDK。
-
-当前仓库没有 `piper_sdk` 源码。
-
-当前仓库没有 Piper SDK adapter。
-
-当前仓库没有 CAN adapter。
-
-当前仓库没有 hardware interface。
-
-当前仓库没有 MoveIt、MuJoCo 或 RCM solver 实现。
-
-因此，本节所有 SDK 写控制内容都属于 `PLANNED` 或 `RESEARCH`。
-
-H0-H6 前，本节只允许用于安装、版本记录、只读 SocketCAN 检查、只读 SDK 状态读取设计和 adapter 边界设计。
-
-### 6.1 SDK 是什么
-
-松灵 / AgileX 官方 Piper SDK 是用于控制 Piper 机械臂的 Python SDK。
-
-官方仓库地址是 `https://github.com/agilexrobotics/piper_sdk`。
-
-Python 包名通常记录为 `piper_sdk`，PyPI 包名记录为 `piper-sdk`。
-
-PyPI 说明中依赖 `python-can > 3.3.4`。
-
-官方 README 给出的 SDK 使用方式包含 PyPI 安装、源码安装和 release wheel 安装。
-
-官方 release 持续更新接口能力，例如 FK calculation、SDK joint/gripper limit、load setting demo 等。
-
-因此文档、日志和证据包必须记录 SDK version、commit 或 release。
-
-不要在本文档中固定未经验证的函数名。
-
-如果示例提到 `C_PiperInterface` 或 `C_PiperInterface_V2`，只表示官方 README 或 demo 中出现过该接口名。
-
-实际使用前必须以当前安装版本的 README、demo 和 interface 文档为准。
-
-### 6.2 安装方式
-
-安装前先记录 Python、pip、OS、架构和 ROS 环境。
-
-```bash
-python3 --version
-python3 -m pip --version
-uname -m
-lsb_release -a
-```
-
-这些命令只采集环境，不访问机械臂。
-
-PyPI 安装路径如下。
-
-```bash
-python3 -m pip install --upgrade pip
-python3 -m pip install python-can
-python3 -m pip install piper_sdk
-python3 -m pip show piper_sdk
-```
-
-如果项目使用虚拟环境，应在虚拟环境内执行并记录 virtualenv 路径。
-
-源码安装路径如下。
-
-```bash
-git clone https://github.com/agilexrobotics/piper_sdk.git
-cd piper_sdk
-python3 -m pip install .
-python3 -m pip show piper_sdk
-```
-
-源码安装必须记录 commit hash。
-
-```bash
-git rev-parse HEAD
-git status --short
-```
-
-wheel 安装路径如下。
-
-```bash
-python3 -m pip install ./piper_sdk-REPLACE_WITH_VERSION-py3-none-any.whl
-python3 -m pip show piper_sdk
-```
-
-wheel 安装必须记录 wheel 文件名、下载来源、hash 和下载日期。
-
-升级、查询和卸载命令如下。
-
-```bash
-python3 -m pip show piper_sdk
-python3 -m pip install --upgrade piper_sdk
-python3 -m pip uninstall piper_sdk
-```
-
-升级 SDK 前必须保存旧版本证据。
-
-升级后必须重新跑只读连接、joint-order、单位和限位检查。
-
-### 6.3 CAN 模块依赖
-
-官方 README 的 CAN 模块说明依赖 `can-utils` 和 `ethtool`。
-
-缺少 `ip` 命令时安装 `iproute2`。
-
-Ubuntu 22.04 示例安装命令如下。
-
-```bash
-sudo apt update
-sudo apt install -y can-utils ethtool iproute2
-```
-
-这些包只是诊断和配置工具。
-
-安装这些包不代表机器人已经可以控制。
-
-### 6.4 版本记录表
-
-每次 SDK 测试前，先填写下表。
-
-| 字段 | 示例值 | 必填原因 |
-| --- | --- | --- |
-| robot serial | `PIPER-REPLACE` | 区分机械臂个体 |
-| firmware version | `REPLACE` | 判断固件/API 兼容性 |
-| SDK version | `pip3 show piper_sdk` 输出 | 判断 Python 包行为 |
-| SDK commit | `git rev-parse HEAD` | 源码安装时定位接口 |
-| SDK release / wheel | `vX.Y.Z` 或 wheel 文件名 | wheel 安装时定位接口 |
-| API 版本 / 接口语义 | README、demo、interface 文档引用 | 避免函数语义漂移 |
-| CAN interface | `can0` 或实际名称 | SocketCAN 绑定 |
-| CAN bitrate | 厂商文档确认值 | 错误 bitrate 会导致通信失败 |
-| USB-CAN adapter | 型号、序列号、driver | x86_64 与 ARM64 行为可能不同 |
-| host architecture | `x86_64` / `aarch64` | wheel 和 driver 兼容性 |
-| Python version | `python3 --version` | SDK 运行环境 |
-| test date | `YYYY-MM-DD` | 证据时效 |
-| operator | 操作者姓名 | 责任追踪 |
-
-版本记录必须跟随 evidence package 保存。
-
-只记录 firmware/SDK 不够；API 行为变化同样可能导致错误运动。
-
-### 6.5 CAN 设备识别与只读 bring-up
-
-先确认系统是否看到 CAN interface。
-
-```bash
-ip link
-ip -details link show can0
-```
-
-如果没有 `can0`，记录实际 interface 名称，不要强行假设。
-
-按厂商 bitrate 设置 interface。
-
-```bash
-sudo ip link set can0 down
-sudo ip link set can0 type can bitrate 1000000
-sudo ip link set can0 up
-ip -details link show can0
-```
-
-上面的 `1000000` 只是示例，必须替换为当前 Piper 文档或 SDK demo 要求的 bitrate。
-
-只读观察使用下面命令。
-
-```bash
-candump -L can0
-```
-
-不要在 H0-H6 前发送任何运动、enable、zero、home、mode、torque、current、impedance、gain 或 MIT 相关命令。
-
-不要把社区示例中的写帧搬到 live arm。
-
-### 6.6 SDK 只读初始化流程
-
-官方 README 的 simple start 是读取关节角。
-
-这类读取流程可以作为 H5 只读 SDK gate 的候选，但必须先完成 SocketCAN evidence。
-
-`C_PiperInterface` 与 `C_PiperInterface_V2` 可接收 CAN interface 名称。
-
-非官方 CAN 设备可能需要额外参数，例如把第二参数设为 `False`，不要默认假设使用内置 CAN。
-
-下面片段只展示“版本确认和只读边界”，不是可直接运行的 live arm 控制脚本。
+该 launch 只允许做模型显示：
 
 ```python
-#!/usr/bin/env python3
-"""PLANNED read-only SDK probe skeleton.
+# PLANNED：模型显示 launch 结构示意，不连接 SDK/CAN。
+robot_state_publisher = Node(
+    package="robot_state_publisher",
+    executable="robot_state_publisher",
+    parameters=[{"robot_description": robot_description}],
+)
 
-请先执行：python3 -m pip show piper_sdk
-请阅读当前版本 README、demo 与 interface 文档。
-请确认 CAN interface、bitrate、adapter 类型和固件兼容性。
-此文件不得包含 enable、zero、home、motion、write、torque、current、MIT 命令。
-"""
-from dataclasses import dataclass
-from typing import Any
-
-
-@dataclass(frozen=True)
-class PiperSdkIdentity:
-    sdk_version: str
-    sdk_source: str
-    can_interface: str
-    can_bitrate: int
-    adapter_model: str
-
-
-class PiperReadOnlyProbe:
-    def __init__(self, identity: PiperSdkIdentity) -> None:
-        self.identity = identity
-        self._sdk: Any | None = None
-
-    def connect(self) -> None:
-        raise NotImplementedError(
-            "Bind this to the read-only constructor from the pinned piper_sdk version. "
-            "If C_PiperInterface_V2 is used, verify the current signature first."
-        )
-
-    def read_joint_angles(self) -> list[float]:
-        raise NotImplementedError(
-            "Bind this to the official read-only joint-angle demo for this SDK version."
-        )
-
-    def read_status(self) -> dict[str, Any]:
-        raise NotImplementedError(
-            "Bind this to read-only status/error/version APIs after reading current docs."
-        )
+joint_state_publisher_gui = Node(
+    package="joint_state_publisher_gui",
+    executable="joint_state_publisher_gui",
+)
 ```
 
-该 skeleton 的目的不是猜 API，而是强制把 SDK 版本、CAN interface 和只读方法绑定在同一个审查点。
-
-如果当前 SDK demo 使用 `C_PiperInterface_V2("can0", False)` 之类参数形态，必须在 evidence 中说明第二参数的含义和 CAN adapter 类型。
-
-### 6.7 只读 adapter skeleton
-
-ROS 控制核心不应直接依赖 SDK 原始单位或函数名。
-
-建议先建立只读 adapter 边界，输出 joint state、status、error 和 version。
-
-所有单位转换隔离在 adapter 边界。
-
-控制核心只使用 SI 单位：rad、rad/s、m、s、N、Nm。
-
-下面 skeleton 仍然只读，不包含任何 enable 或 write。
-
-```python
-#!/usr/bin/env python3
-from dataclasses import dataclass
-from typing import Any
-
-
-@dataclass(frozen=True)
-class PiperJointStateSI:
-    names: tuple[str, ...]
-    position_rad: tuple[float, ...]
-    velocity_rad_s: tuple[float, ...]
-    stamp_s: float
-
-
-@dataclass(frozen=True)
-class PiperStatus:
-    sdk_version: str
-    firmware_version: str
-    api_semantics: str
-    can_interface: str
-    errors: tuple[str, ...]
-    warnings: tuple[str, ...]
-
-
-class PiperSdkReadOnlyAdapter:
-    def __init__(self, sdk_impl: Any, joint_order: tuple[str, ...]) -> None:
-        self._sdk = sdk_impl
-        self._joint_order = joint_order
-
-    def read_joint_state_si(self) -> PiperJointStateSI:
-        raise NotImplementedError(
-            "Read raw SDK joint angles, verify joint order, convert to rad, and return SI state."
-        )
-
-    def read_status(self) -> PiperStatus:
-        raise NotImplementedError(
-            "Read SDK/firmware/API/status/error fields without sending actuator commands."
-        )
-```
-
-adapter 单元测试必须覆盖单位转换、关节顺序、缺字段、过期 timestamp 和 SDK 异常。
-
-adapter 出错时返回 fault，不允许上层用 fallback zero 覆盖未知状态。
-
-### 6.8 H0-H6 前禁止事项
-
-H0-H6 前禁止 enable。
-
-H0-H6 前禁止 motion。
-
-H0-H6 前禁止 zero。
-
-H0-H6 前禁止 write。
-
-H0-H6 前禁止 设零 写入固件。
-
-H0-H6 前禁止 回零 运动。
-
-H0-H6 前禁止 torque control。
-
-H0-H6 前禁止 current control。
-
-H0-H6 前禁止 impedance control。
-
-H0-H6 前禁止 gain-level tuning。
-
-H0-H6 前禁止 low-level motor-control。
-
-H0-H6 前禁止 MIT protocol live control。
-
-官方 notes 明确，MIT protocol for controlling individual joints 是高级功能，误用可能损坏机械臂。
-
-H0-H6 前禁止复制官方 demo 或 community adapter 到 live arm 上运行写控制。
-
-H0-H6 前禁止把 joystick `/rcm_cmd` 连接到 SDK command。
-
-H0-H6 前禁止以“只是低速”为理由绕过 command owner、watchdog 或 joint-order check。
-
-### 6.9 H0-H6 后的计划写控制包装
-
-只有 H0-H6 通过后，才能设计 SDK 写控制 wrapper。
-
-写控制 wrapper 必须只有一个 command owner。
-
-写控制 wrapper 必须有 watchdog。
-
-写控制 wrapper 必须有 joint-order check。
-
-写控制 wrapper 必须有 unit conversion check。
-
-写控制 wrapper 必须有 limit clamp 或 explicit rejection。
-
-写控制 wrapper 必须要求 ROS lifecycle active。
-
-写控制 wrapper 必须检查 command timestamp。
-
-写控制 wrapper 必须在 SDK error、CAN error、stale command、limit violation 时 fail-closed。
-
-写控制 wrapper 必须默认禁用 live backend。
-
-写控制 wrapper 必须先通过 mock backend。
-
-写控制 wrapper 必须先通过 replay test。
-
-写控制 wrapper 必须先通过 HIL test。
-
-写控制 wrapper 必须记录每次 enable、disable、fault 和 recovery。
-
-### 6.10 SDK 故障排查
-
-| 现象 | 可能原因 | 只读诊断 | 处理 |
-| --- | --- | --- | --- |
-| `ip link` 看不到 CAN | adapter 未识别、驱动缺失、线缆问题 | `lsusb`、`dmesg --ctime` | 停止 SDK 测试，先修复 adapter |
-| `can0` 存在但 down | interface 未激活 | `ip -details link show can0` | 按厂商 bitrate 激活 |
-| `candump` 无 frame | robot silent、接线错误、bitrate 错误 | `candump -L can0`、`ip -details link show can0` | 保持只读，核对 wiring 和 bitrate |
-| SDK 无法导入 | Python 环境或安装路径错误 | `python3 -m pip show piper_sdk` | 记录环境，重装或切换 venv |
-| SDK 连接失败 | CAN interface 名称错误 | `ip link` | 使用实际 interface 名称 |
-| 非官方 CAN 设备异常 | constructor 参数不匹配 | 当前 SDK README/demo | 按当前版本设置参数，例如非内置 CAN 标志 |
-| `SendCanMessage(SEND_MESSAGE_FAILED (100017))` | 连接、总线、机械臂状态或 SDK 传输失败 | 保存完整日志 | 检查连接，按官方 notes 断电重启机械臂后再试 |
-| 读取角度不合理 | 单位或 joint order 错误 | adapter unit test、joint-order evidence | 阻塞写控制，重新核对 |
-| SDK demo 行为与文档不一致 | SDK/API/firmware 不匹配 | 版本记录表 | 固定版本并回到只读验证 |
-| ARM64 可安装但运行异常 | wheel、driver 或 ABI 差异 | `uname -m`、pip metadata、driver log | 单独建立 ARM64 证据 |
-
-出现 SDK 错误时，不要用默认零位或上次状态假装读数有效。
-
-出现 `SendCanMessage(SEND_MESSAGE_FAILED (100017))` 时，按官方 notes 检查连接，并断电重启机械臂后再试。
-
-### 6.11 SDK 资料链接与证据来源
-
-官方 SDK 仓库：`https://github.com/agilexrobotics/piper_sdk`。
-
-SDK 安装、demo、interface 语义和 CAN 说明以官方 README、release notes、demo 目录和当前源码为准。
-
-PyPI `piper-sdk` 页面用于记录 Python package dependency，例如 `python-can > 3.3.4`。
-
-SDK release 页面用于判断接口变化，例如 FK calculation、joint/gripper limit、load setting demo 等能力。
-
-证据包中必须保存访问日期、版本号、commit 或 release 标识。
-
-不要把第三方 adapter 的 README 当成 live arm 安全依据。
-
-### 6.12 文档维护约束
-
-本仓库的使用说明集中在 `docs/PIPER_RCM_DEVELOPMENT_GUIDE.md`。
-
-当前任务不修改 `README.md`。
-
-当前任务不新增第二份 docs Markdown。
-
-当前任务不创建文档归档目录。
-
-如果未来需要拆分文档，必须先由项目 owner 明确批准，并更新文档索引和维护规则。
-
-
-## 7. 手柄接口契约（CURRENT）
-
-当前手柄契约是 intent interface，不是硬件 command interface。
-
-输入 topic 是 `/joy`。
-
-输入 message type 是 `sensor_msgs/msg/Joy`。
-
-输出 mode topic 是 `/rcm_mode`。
-
-输出 mode type 是 `std_msgs/msg/String`。
-
-输出 command topic 是 `/rcm_cmd`。
-
-输出 command type 是 `geometry_msgs/msg/Vector3`。
-
-The custom node source name is `gamepad_controller`.
-
-The launch name may appear as `rcm_gamepad_controller`.
-
-The mode labels are `IDLE`, `GRAVITY_COMP`, `IMPEDANCE`, and `RCM_CONTROL`.
-
-这些 mode label 只表示用户意图。
-
-这些 mode label 不是硬件 command mode。
-
-The mode labels do not enable gravity compensation.
-
-The mode labels do not enable impedance control.
-
-The mode labels do not enable RCM enforcement.
-
-command vector 只是在软件中累计。
-
-The command vector is reset by the A button.
-
-The command vector increments only while mode is `RCM_CONTROL`.
-
-The left stick Y axis changes pitch intent.
-
-The left stick X axis changes yaw intent.
-
-The right stick Y axis changes insertion intent.
-
-No roll intent exists in the current node.
-
-当前节点没有 deadman button。
-
-当前 command message 没有 command timestamp。
-
-No calibration version exists in the current command message.
-
-No tool ID exists in the current command message.
-
-No validity window exists in the current command message.
-
-No source arbitration exists in the current command message.
-
-当前 command message 没有 command owner。
-
-No safety state exists in the current command message.
-
-下一版接口应把 `Vector3` 替换为 typed command message。
-
-下一版接口应包含 stamp、frame、mode、axes、limits、calibration ID 和 validity timeout。
-
-The current launch can be monitored without hardware.
-
-示例监控命令：
+第 3 步：构建并检查安装结果。
 
 ```bash
-ros2 launch joystick joystick.launch.py
+colcon build --packages-select agx_arm_description --symlink-install
+source install/setup.bash
+ros2 pkg prefix agx_arm_description
+find install/agx_arm_description/share/agx_arm_description -maxdepth 3 -type f | sort
+```
+
+第 4 步：检查 URDF。
+
+```bash
+check_urdf install/agx_arm_description/share/agx_arm_description/urdf/piper/urdf/piper_description.urdf
+```
+
+如果 URDF 路径不同，以实际 `find install/... -name '*.urdf'` 的输出为准。
+
+第 5 步：启动显示。
+
+```bash
+ros2 launch agx_arm_description display_piper.launch.py
+```
+
+RViz 中应检查：
+
+- 模型不缺 mesh。
+- link 尺寸和方向看起来合理。
+- `joint1` 到 `joint6` 移动方向可解释。
+- TF tree 没有断链。
+- tool frame 不和 collision mesh 混用。
+
+### 2.4 工具 frame 怎么设计
+
+RCM 不是控制“末端点到某个点”，而是控制“工具功能轴线穿过 RCM 点”。因此 description 包必须提供清晰的工具几何：
+
+```text
+base_link
+ └── ... joint1 ~ joint6 ...
+      └── flange / link6
+           └── tool_mount
+                ├── tool_axis       # +Z 表示工具功能轴线
+                ├── tool_tip        # 工具工作尖端
+                └── tool_collision  # 工具外形/碰撞模型
+```
+
+原则：
+
+- `tool_axis` 表示功能轴线，不一定等于外形几何中心线。
+- `tool_collision` 表示碰撞外形，可以复杂，但不能替代功能轴线。
+- `tool_tip` 是工作点，用于插入深度或末端可视化。
+- 有效直杆段要在 tool manifest 中定义，例如 `lambda_min_m`、`lambda_max_m`。
+- 如果工具是弯曲或柔性结构，不要硬套单一直线 RCM，需要另做模型。
+
+### 2.5 验收标准和禁止事项
+
+通过标准：
+
+- package 能单独构建。
+- URDF 能被 `check_urdf` 解析。
+- 安装目录中能找到 URDF、mesh、launch、rviz/config。
+- RViz 能显示模型和 TF。
+- joint name/order/limit 有对表记录。
+- tool frame 的设计和 RCM 理论一致。
+
+禁止事项：
+
+- 不要在 controller 中用符号翻转临时修正模型方向错误。
+- 不要把 SDK 的 joint order 写死在 description 之外又不留对表。
+- 不要让 MoveIt、MuJoCo、controller 分别维护不同 joint name。
+- 不要用绝对路径引用 mesh。
+
+---
+
+## 3. 功能包：`rcm_teleop`
+
+### 3.1 作用和边界
+
+`rcm_teleop` 负责把手柄输入转成操作者意图。当前它是 dry-run 输入包，不是真机控制包。
+
+它应该放：
+
+| 内容 | 说明 |
+| --- | --- |
+| 手柄输入解析 | `/joy` axes/buttons 到内部 intent |
+| mode 切换 | 例如 pivot、insert、roll、reset |
+| deadman / enable intent | 表示操作者是否持续允许发送意图 |
+| dry-run topic | 当前 `/rcm_mode`、`/rcm_cmd`，未来 typed intent |
+| 参数 | deadzone、step、speed scale、button mapping |
+| 测试 | 模拟 Joy 消息验证 mode、deadzone、reset、timeout |
+
+它不应该放：
+
+- SDK/CAN import。
+- joint command。
+- MoveIt Execute。
+- RCM solver。
+- 真机 command owner。
+
+### 3.2 当前 dry-run 怎么跑
+
+```bash
+colcon build --packages-select rcm_teleop --symlink-install
+source install/setup.bash
+ros2 launch rcm_teleop rcm_teleop.launch.py
+```
+
+观察 topic：
+
+```bash
 ros2 topic echo /joy
 ros2 topic echo /rcm_mode
 ros2 topic echo /rcm_cmd
-ros2 topic hz /joy
-ros2 topic hz /rcm_cmd
 ```
 
-CURRENT 手柄 dry run 验收标准：
+当前 `/rcm_cmd` 使用普通消息表达累计 intent。它可以验证输入链路，但不能作为 live arm 命令接口长期使用。
 
-The node starts without Python exceptions.
+### 3.3 一步步整理输入逻辑
 
-The `/joy` topic publishes when the gamepad is moved.
+第 1 步：记录手柄映射。
 
-The `/rcm_mode` topic changes when A, B, X, or Y is pressed according to current mapping.
+```text
+button A: reset 或归零 dry-run intent
+button B/X/Y: mode 切换
+axes: pivot / insertion / roll intent
+deadman: 后续必须指定一个持续按压按钮
+```
 
-The `/rcm_cmd` topic remains zero outside `RCM_CONTROL` except when previously accumulated values persist.
+实际按钮编号必须通过 `/joy` 输出确认，不要直接照搬别的手柄。
 
-The `/rcm_cmd` topic resets to zero after A is pressed.
+第 2 步：参数化 deadzone 和步长。
 
-The topic rates remain stable enough for operator input inspection.
-
-## 8. 设零、回零、校准与参考坐标系（PLANNED）
-
-设零 means selecting a software or calibration zero reference.
-
-回零 means commanding or moving the mechanism back to a known home pose.
-
-校零 means validating and correcting the relationship between measured encoder state and the intended zero reference.
-
-Mechanical zero is the physical joint or fixture reference defined by hardware design.
-
-Encoder zero is the sensor count reference used by the drive or vendor firmware.
-
-Software zero is the ROS or controller reference used for kinematics and commands.
-
-TCP zero is the tool center point reference relative to the flange or final link.
-
-Functional axis zero is the task axis reference, such as the insertion axis through the tool.
-
-These are different quantities.
-
-Do not overwrite encoder zero when you only need software zero.
-
-Do not call a software reset homing unless the mechanism actually moved to a verified home.
-
-Do not call joystick A button behavior 回零; it only clears accumulated intent.
-
-PLANNED zeroing flow starts with read-only joint state inspection.
-
-PLANNED zeroing flow records the current joint readings.
-
-PLANNED zeroing flow compares readings to vendor home definitions.
-
-PLANNED zeroing flow stores software offsets in a YAML file.
-
-PLANNED zeroing flow never writes motor firmware offsets during early gates.
-
-PLANNED homing flow should use vendor safe-home procedure after H gates pass.
-
-PLANNED calibration flow should include repeated measurements.
-
-PLANNED calibration flow should include operator sign-off.
-
-PLANNED calibration flow should include rollback to previous offsets.
-
-PLANNED calibration flow should include timestamp and calibration version.
-
-PLANNED calibration flow should include arm serial number.
-
-PLANNED calibration flow should include tool serial number.
-
-PLANNED calibration flow should include flange adapter version.
-
-PLANNED calibration flow should include units.
-
-PLANNED calibration flow should include coordinate frames.
-
-PLANNED 示例：不要直接复制到 live arm。
+建议参数：
 
 ```yaml
-calibration_version: "2026-08-05-piper-benchtop-001"
-arm_serial: "REPLACE_WITH_ARM_SERIAL"
-tool_serial: "REPLACE_WITH_TOOL_SERIAL"
-operator: "REPLACE_WITH_OPERATOR"
-frames:
-  base_frame: "base_link"
-  flange_frame: "link6"
-  tcp_frame: "tool_tip"
-  rcm_frame: "rcm"
-joint_software_zero_rad:
-  joint1: 0.0
-  joint2: 0.0
-  joint3: 0.0
-  joint4: 0.0
-  joint5: 0.0
-  joint6: 0.0
-tcp_in_flange_m:
-  xyz: [0.0, 0.0, 0.120]
-  rpy: [0.0, 0.0, 0.0]
-tool_axis_in_tcp:
-  direction: [0.0, 0.0, 1.0]
-rcm_point_in_base_m:
-  xyz: [0.300, 0.000, 0.250]
-evidence:
-  measured_samples: 10
-  max_repeatability_error_m: 0.001
-  notes: "Dry-run placeholder only."
+rcm_teleop:
+  ros__parameters:
+    deadzone: 0.08
+    translational_step_m: 0.001
+    angular_step_rad: 0.01
+    max_speed_scale: 0.2
+    command_valid_for_sec: 0.1
 ```
 
-PLANNED 示例：不要直接复制到 live arm。
+第 3 步：把输入解析和消息发布分开。
+
+推荐内部结构：
+
+```text
+Joy callback
+  -> parse axes/buttons
+  -> GamepadIntent 内部结构
+  -> apply deadzone / mode / reset
+  -> publish dry-run message 或 typed intent
+```
+
+这样后续迁移到 `rcm_msgs` 时，不需要把整个节点重写。
+
+第 4 步：增加命令有效期。
+
+手柄断开、节点卡顿或 topic 过期时，后续 controller 必须能拒绝旧命令。typed intent 中应包含 timestamp 和 `valid_for_sec`。
+
+第 5 步：保留 dry-run 输出一段时间。
+
+迁移到 `rcm_msgs` 后，可以短期保留旧 `/rcm_cmd` 作为观察输出，但不能让 live command owner 订阅旧 dry-run topic。
+
+### 3.4 未来 typed intent 示例
 
 ```python
-#!/usr/bin/env python3
-from dataclasses import dataclass
-from pathlib import Path
-import yaml
-
-
-@dataclass
-class ZeroOffsets:
-    joint_names: list[str]
-    offsets_rad: list[float]
-    calibration_version: str
-
-
-def load_zero_offsets(path: Path) -> ZeroOffsets:
-    data = yaml.safe_load(path.read_text())
-    joint_map = data["joint_software_zero_rad"]
-    names = ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"]
-    return ZeroOffsets(
-        joint_names=names,
-        offsets_rad=[float(joint_map[name]) for name in names],
-        calibration_version=str(data["calibration_version"]),
-    )
-
-
-def apply_software_zero(raw_positions_rad: list[float], offsets: ZeroOffsets) -> list[float]:
-    if len(raw_positions_rad) != len(offsets.offsets_rad):
-        raise ValueError("joint count mismatch")
-    return [q - dq for q, dq in zip(raw_positions_rad, offsets.offsets_rad)]
-
-
-def main() -> None:
-    offsets = load_zero_offsets(Path("config/piper_calibration.yaml"))
-    print(offsets)
-
-
-if __name__ == "__main__":
-    main()
+# PLANNED：字段组织示意。这里只用于文档说明，不表示当前已经实现。
+cmd.header.stamp = node.get_clock().now().to_msg()
+cmd.header.frame_id = "base_link"
+cmd.enable = deadman_pressed
+cmd.mode = RCM_MODE_PIVOT
+cmd.max_speed_scale = configured_speed_scale
+cmd.valid_for_sec = 0.1
+cmd.tool_id = current_tool_id
+cmd.calibration_version = current_calibration_version
 ```
 
-设零/回零/校准验收标准：
+注意：`enable=true` 只是操作者意图，不等于硬件允许运动。真正是否输出写命令，由 `agx_arm_controller` 和 `agx_arm_hw_interface` 的状态机判断。
 
-The operator can identify which zero is being changed.
+### 3.5 Python 和 C++ 取舍
 
-The old calibration file is preserved by version control or evidence process.
+当前 `rcm_teleop` 用 Python 是合理的，因为手柄输入低频、便于调试、不直接写硬件。真正影响机械臂流畅性的链路是 controller、solver、watchdog、hardware interface 和 command owner，这些应优先用 C++。
 
-The new calibration file names the arm and tool.
+只有在以下情况才考虑把 rcm_teleop 核心迁移到 C++：
 
-The transformation chain is explicit.
+- 同时融合多个高频输入源。
+- 输入滤波和状态机复杂到 Python 难以稳定维护。
+- 需要和 C++ controller 在同一进程内做低延迟通信。
+- 安全审查要求所有 live-adjacent 输入链路使用 C++。
 
-The live controller rejects commands when calibration is missing.
+### 3.6 验收标准
 
-The live controller rejects commands when calibration version does not match runtime config.
+- 手柄静止时 `/rcm_cmd` 不漂移。
+- mode 切换可复查，日志中能看到状态变化。
+- deadman 未按下时，未来 typed intent 必须表达 `enable=false`。
+- 手柄断开后，controller 不会继续使用旧命令。
+- 单元测试覆盖 deadzone、reset、mode、timeout。
 
-The live controller rejects commands when joint state age exceeds timeout.
+---
 
-## 9. URDF、TF 与 RViz 计划工作（CURRENT/PLANNED）
+## 4. 功能包：`rcm_msgs`
 
-CURRENT URDF can be inspected as a model asset.
+### 4.1 作用和边界
 
-PLANNED RViz work should expose the current model through `robot_state_publisher`.
+`rcm_msgs` 是建议新增的强类型接口包。它只放 `.msg`、`.srv`、`.action` 和接口枚举说明，不放节点实现、算法、SDK 或 launch。
 
-PLANNED RViz work should add frames for flange, tool0, tool_tip, tool_axis, and rcm only after calibration definitions exist.
+为什么必须有这个包：RCM 命令不是普通三维向量。它需要包含 frame、timestamp、有效期、工具 ID、标定版本、enable、mode、速度缩放、状态码和 reason code。长期用 `Vector3` 会让安全语义散落在代码注释里。
 
-PLANNED TF should keep `world` and `base_link` semantics stable.
+### 4.2 推荐目录
 
-PLANNED TF should document whether `world` is lab world or robot mounting world.
+```text
+src/rcm_msgs/
+├── package.xml
+├── CMakeLists.txt
+├── msg/
+│   ├── RCMCommand.msg
+│   ├── RCMStatus.msg
+│   └── RCMDiagnostics.msg
+├── srv/
+│   └── SetRCMMode.srv
+└── action/
+    └── CalibrateToolAxis.action   # 可选，后续标定流程再加
+```
 
-PLANNED TF should document whether `base_link` is mechanical base or vendor base.
+### 4.3 一步步创建接口包
 
-PLANNED TF should publish joint states from mock data before hardware.
+第 1 步：创建包。
 
-PLANNED TF should validate axis signs against visual markers.
+```bash
+cd src
+ros2 pkg create rcm_msgs --build-type ament_cmake
+mkdir -p rcm_msgs/msg rcm_msgs/srv rcm_msgs/action
+```
 
-PLANNED 示例：不要直接复制到 live arm。
+第 2 步：在 `package.xml` 中声明接口依赖。
 
 ```xml
-<!-- URDF/xacro snippet for future tool frames only. -->
-<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="piper_rcm">
-  <xacro:property name="tool_length" value="0.120" />
+<!-- PLANNED：接口包依赖示意。 -->
+<buildtool_depend>ament_cmake</buildtool_depend>
+<build_depend>rosidl_default_generators</build_depend>
+<exec_depend>rosidl_default_runtime</exec_depend>
+<member_of_group>rosidl_interface_packages</member_of_group>
 
-  <link name="tool0" />
-  <joint name="link6_to_tool0" type="fixed">
-    <parent link="link6" />
-    <child link="tool0" />
-    <origin xyz="0 0 0" rpy="0 0 0" />
-  </joint>
-
-  <link name="tool_tip" />
-  <joint name="tool0_to_tool_tip" type="fixed">
-    <parent link="tool0" />
-    <child link="tool_tip" />
-    <origin xyz="0 0 ${tool_length}" rpy="0 0 0" />
-  </joint>
-
-  <link name="rcm" />
-  <joint name="world_to_rcm" type="fixed">
-    <parent link="world" />
-    <child link="rcm" />
-    <origin xyz="0.30 0.00 0.25" rpy="0 0 0" />
-  </joint>
-</robot>
+<depend>std_msgs</depend>
+<depend>geometry_msgs</depend>
 ```
 
-PLANNED 示例：不要直接复制到 live arm。
+第 3 步：在 `CMakeLists.txt` 中生成接口。
 
-```launch.py
-# launch.py snippet for planned RViz visualization.
-from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
-from launch.substitutions import Command, LaunchConfiguration, PathJoinSubstitution
-from launch_ros.actions import Node
-from launch_ros.substitutions import FindPackageShare
+```cmake
+# PLANNED：接口生成示意。
+find_package(ament_cmake REQUIRED)
+find_package(rosidl_default_generators REQUIRED)
+find_package(std_msgs REQUIRED)
+find_package(geometry_msgs REQUIRED)
 
+rosidl_generate_interfaces(${PROJECT_NAME}
+  "msg/RCMCommand.msg"
+  "msg/RCMStatus.msg"
+  "msg/RCMDiagnostics.msg"
+  "srv/SetRCMMode.srv"
+  DEPENDENCIES std_msgs geometry_msgs
+)
 
-def generate_launch_description():
-    model = LaunchConfiguration("model")
-    return LaunchDescription([
-        DeclareLaunchArgument(
-            "model",
-            default_value=PathJoinSubstitution([
-                FindPackageShare("agx_arm_description"),
-                "urdf",
-                "piper",
-                "urdf",
-                "piper_description.urdf",
-            ]),
-        ),
-        Node(
-            package="robot_state_publisher",
-            executable="robot_state_publisher",
-            parameters=[{"robot_description": Command(["xacro ", model])}],
-            output="screen",
-        ),
-        Node(
-            package="joint_state_publisher_gui",
-            executable="joint_state_publisher_gui",
-            output="screen",
-        ),
-        Node(package="rviz2", executable="rviz2", output="screen"),
-    ])
+ament_export_dependencies(rosidl_default_runtime)
+ament_package()
 ```
 
-PLANNED RViz 验收标准：
+第 4 步：构建并检查接口。
 
-The robot appears with all six arm joints.
-
-The base frame is stable.
-
-The terminal link matches `link6` unless a planned flange frame is added.
-
-The tool axis marker aligns with the intended insertion direction.
-
-The RCM marker is visually distinct.
-
-The TF tree contains no disconnected required frames.
-
-The launch does not require a physical arm.
-
-## 10. ros2_control 计划硬件接口（PLANNED）
-
-`ros2_control` is PLANNED in this repository.
-
-The hardware interface must be the single owner of physical arm commands.
-
-The hardware interface must separate read state from write command.
-
-The hardware interface must support a mock backend before Piper backend.
-
-The hardware interface must enforce lifecycle activation.
-
-The hardware interface must reject write commands before activation.
-
-The hardware interface must reject stale commands.
-
-The hardware interface must reject commands outside position, velocity, and acceleration limits.
-
-The hardware interface must log SDK version, API version, firmware version, and firmware/SDK/API compatibility status.
-
-The hardware interface watchdog must define heartbeat source, timeout threshold, stop/fail-closed action, recovery condition, and required evidence logs before HIL/live use.
-
-Command enable requires joint-order evidence proving URDF, ROS controller, vendor SDK/API, CAN protocol, MuJoCo, and MoveIt mappings agree for `joint1` through `joint6`.
-
-The hardware interface must expose command mode explicitly.
-
-The hardware interface must start with position trajectory control, not torque control.
-
-The hardware interface must integrate `joint_trajectory_controller` only after mock tests pass.
-
-The hardware interface must keep `piper_sdk` transport behind an adapter boundary.
-
-The adapter boundary allows unit tests without CAN hardware.
-
-Target platforms are x86_64 Ubuntu 22.04 and ARM64 Ubuntu 22.04.
-
-Dependency matrix starts with ROS 2 Humble, Eigen, and the vendor SDK.
-
-PCL and OpenCV are not required for the first hardware interface unless perception enters scope.
-
-Pinocchio or KDL are required only when dynamics or kinematics solvers enter scope.
-
-PLANNED 示例：不要直接复制到 live arm。
-
-```cpp
-// C++ skeleton for a future ros2_control SystemInterface.
-#include <array>
-#include <string>
-#include <vector>
-
-#include "hardware_interface/system_interface.hpp"
-#include "hardware_interface/types/hardware_interface_return_values.hpp"
-#include "rclcpp_lifecycle/state.hpp"
-
-namespace piper_control
-{
-
-class PiperSystemHardware final : public hardware_interface::SystemInterface
-{
-public:
-  hardware_interface::CallbackReturn on_init(
-    const hardware_interface::HardwareInfo & info) override;
-
-  std::vector<hardware_interface::StateInterface> export_state_interfaces() override;
-
-  std::vector<hardware_interface::CommandInterface> export_command_interfaces() override;
-
-  hardware_interface::CallbackReturn on_activate(
-    const rclcpp_lifecycle::State & previous_state) override;
-
-  hardware_interface::CallbackReturn on_deactivate(
-    const rclcpp_lifecycle::State & previous_state) override;
-
-  hardware_interface::return_type read(
-    const rclcpp::Time & time,
-    const rclcpp::Duration & period) override;
-
-  hardware_interface::return_type write(
-    const rclcpp::Time & time,
-    const rclcpp::Duration & period) override;
-
-private:
-  static constexpr size_t kDof = 6;
-  std::array<double, kDof> position_rad_{};
-  std::array<double, kDof> velocity_rad_s_{};
-  std::array<double, kDof> command_position_rad_{};
-  bool active_{false};
-};
-
-}  // namespace piper_control
+```bash
+colcon build --packages-select rcm_msgs --symlink-install
+source install/setup.bash
+ros2 interface list | grep rcm_msgs
+ros2 interface show rcm_msgs/msg/RCMCommand
 ```
 
-PLANNED 示例：不要直接复制到 live arm。
+### 4.4 推荐 `RCMCommand`
+
+```text
+# PLANNED: rcm_msgs/msg/RCMCommand.msg
+std_msgs/Header header
+
+# RCM 固定点，推荐先约定在 base_link 下表达。
+geometry_msgs/Point pivot_base
+
+# 工具轴目标方向或当前 shaft direction intent，必须说明是否单位向量。
+geometry_msgs/Vector3 shaft_direction_base
+
+# RCM 兼容任务速度。
+float64 insertion_velocity_mps
+float64 roll_velocity_radps
+float64 pivot_velocity_scale
+
+# 安全字段。
+float64 max_speed_scale
+float64 valid_for_sec
+bool enable
+uint8 mode
+
+# 工具和标定一致性。
+string tool_id
+string calibration_version
+```
+
+字段说明：
+
+- `header.stamp` 是命令生成时间，controller 必须检查是否过期。
+- `header.frame_id` 第一版建议固定为 `base_link`，后续如支持其他 frame，必须显式 TF 转换和时间戳检查。
+- `pivot_base` 是 RCM 点，不是 TCP 目标。
+- `shaft_direction_base` 必须说明是否单位向量；controller 应拒绝 NaN 和零向量。
+- `max_speed_scale` 只能缩小速度，不允许绕过硬件限速。
+- `tool_id` 和 `calibration_version` 必须和当前加载 tool manifest 一致。
+
+### 4.5 推荐 `RCMStatus`
+
+```text
+# PLANNED: rcm_msgs/msg/RCMStatus.msg
+std_msgs/Header header
+
+float64 rcm_distance_m
+float64 axis_error_norm
+float64 insertion_m
+float64 sigma_min
+float64 condition_number
+float64 task_scale
+
+uint8 controller_state
+uint8 solver_status
+uint32 active_constraints
+
+bool rcm_within_tolerance
+bool command_owner_active
+bool feedback_fresh
+bool command_fresh
+
+string reason_code
+string tool_id
+string calibration_version
+```
+
+状态消息必须能回答三个问题：现在是否允许控制、为什么停、RCM 误差是多少。没有这些字段，调试时只能靠日志猜。
+
+### 4.6 迁移顺序
+
+1. 先新增 `rcm_msgs`，只构建接口，不改控制逻辑。
+2. 让 `rcm_teleop` 增加对 `rcm_msgs` 的依赖，新增 typed intent topic。
+3. 让 `agx_arm_controller` 订阅 typed command，旧 dry-run topic 只做调试。
+4. 让 `agx_arm_hw_interface` 只接收 controller/command owner 授权后的命令，不订阅 rcm_teleop。
+5. 文档和测试中固定 message 字段、单位、frame、timeout、reason code。
+
+---
+
+## 5. RCM 纯理论：远心点约束、工具轴线和求解器
+
+本章只讲理论、几何关系和求解思路，不绑定某个 ROS 节点。它的目标是让读者先知道 RCM 为什么不是普通末端位姿控制、工具轴线应该怎么定义、雅可比从哪里来、求解器为什么不能简单裁剪关节速度。理解本章后，再进入第 6 章的 `agx_arm_controller` C++ 实现。
+
+本章建议按下面顺序读：
+
+```text
+物理约束是什么
+  -> 坐标系和符号怎么定义
+  -> 点到线残差怎么计算
+  -> 工具轴线和有效直杆段怎么标定
+  -> 六轴机械臂自由度够不够
+  -> 关节速度如何影响 RCM 残差
+  -> DLS/QP/SNS 怎么求 q_dot
+  -> 求解失败时怎么停
+```
+
+### 5.1 RCM 到底约束什么
+
+RCM（Remote Center of Motion，远程运动中心）要求工具的功能轴线始终穿过空间中的固定点。这个固定点通常是套管、孔、穿刺入口或机械导向中心。
+
+工具可以：
+
+- 绕 RCM 点摆动。
+- 沿工具轴线插入或退出。
+- 绕工具轴线滚转。
+
+工具不应该：
+
+- 在入口点产生横向拉扯。
+- 把普通 TCP pose goal 当作 RCM 约束。
+- 在 RCM 残差增大时继续插入。
+
+一个更直观的理解是：RCM 点像一个固定小孔，工具像一根穿过小孔的直杆。机械臂末端可以在小孔外侧改变工具方向，也可以让工具沿杆方向进出，但不能让工具在小孔处横向扫动。横向扫动会把入口当成支点强行撬动，这正是 RCM 要避免的风险。
+
+RCM 和普通控制目标的区别：
+
+| 控制目标 | 控制对象 | 能否天然保证 RCM | 说明 |
+| --- | --- | --- | --- |
+| TCP 位置控制 | 工具尖端点 | 不能 | TCP 到位时，工具轴线可能没有穿过入口点 |
+| TCP 位姿控制 | 工具尖端 6D pose | 不能 | 姿态正确也不等于入口横向误差为 0 |
+| 关节轨迹跟踪 | 六个关节角 | 不能 | 轨迹可执行不等于工具轴线过 RCM 点 |
+| RCM 控制 | 工具轴线和固定点 | 可以 | 直接约束入口点到工具轴线的横向距离 |
+
+因此，RCM 控制的第一原则是：**控制对象不是某一个末端点，而是一条工具功能轴线和一个固定空间点之间的几何关系**。
+
+实际项目中要先回答四个问题：
+
+1. 哪个点是 RCM 点？它在 `base_link`、相机坐标系还是外部定位坐标系下？
+2. 哪条线是工具功能轴线？它是针体中心线、镜管中心线、视觉光轴，还是夹具定义的偏置轴线？
+3. RCM 点是否落在工具真实有效直杆段内，而不只是落在数学无限延长线上？
+4. 当约束不满足时，系统应该降速、保持、撤出，还是进入 fault？
+
+如果这四个问题没有写清楚，后续控制器即使能动，也不能证明是在做 RCM 控制。
+
+### 5.2 坐标系、变量和符号约定
+
+RCM 理论里最容易出错的不是公式，而是坐标系混用。建议先统一以下符号：
+
+| 符号 | 含义 | 推荐坐标系 |
+| --- | --- | --- |
+| `B` | 机器人基座坐标系，例如 `base_link` | 主控制坐标系 |
+| `F` | 法兰或第六轴末端坐标系，例如 `link6` / `flange` | 工具安装基准 |
+| `T` | 工具坐标系，例如 `tool_axis`、`tool_tip` | 工具几何定义 |
+| `q` | 六个关节角 | rad |
+| `q_dot` | 六个关节速度 | rad/s |
+| `p_R_B` | RCM 点在基座坐标系下的位置 | m |
+| `p0_F` | 工具轴线上一点，在法兰坐标系下定义 | m |
+| `u_F` | 工具轴线方向，在法兰坐标系下定义 | 单位向量 |
+| `p0_B` | 工具轴线上一点，变换到基座坐标系 | m |
+| `u_B` | 工具轴线方向，变换到基座坐标系 | 单位向量 |
+| `e_RCM` | RCM 横向误差向量 | m |
+| `d_RCM` | RCM 横向误差距离 | m |
+
+推荐所有控制计算先统一到 `base_link` 下完成。比如相机给出一个入口点 `p_R_C`，也必须先通过带时间戳的 TF 或外参变换成 `p_R_B`，再进入 RCM 公式。不要在一个公式里同时混用 `base_link` 点、法兰方向和相机坐标下的 pivot。
+
+从法兰到基座的正运动学记为：
+
+```text
+T_BF(q) = [ R_BF(q)   p_F_B(q) ]
+          [   0            1   ]
+```
+
+其中：
+
+- `R_BF(q)` 是法兰相对基座的旋转矩阵。
+- `p_F_B(q)` 是法兰原点在基座坐标系下的位置。
+
+工具轴线从法兰坐标系变换到基座坐标系：
+
+```text
+p0_B(q) = R_BF(q) * p0_F + p_F_B(q)
+u_B(q)  = R_BF(q) * u_F
+```
+
+注意 `u_B` 是方向向量，只受旋转影响，不应该加平移。实现中如果把方向向量当成点做齐次变换，会引入错误平移分量。
+
+### 5.3 点到线残差
+
+工具轴线由一点 `p0` 和单位方向 `u` 表示：
+
+```text
+line(lambda) = p0 + lambda * u
+||u|| = 1
+```
+
+RCM 点 `p_R` 到该直线的横向误差为：
+
+```text
+e = (I - u u^T) (p_R - p0)
+d_RCM = ||e||
+```
+
+`I - u u^T` 是投影矩阵，它去掉沿工具轴方向的分量，只保留垂直于工具轴的误差。工具沿轴向插入时，轴向分量可以变化；真正要控制的是横向误差 `e`。
+
+也可以用叉乘形式：
+
+```text
+c = u x (p_R - p0)
+```
+
+但 `c` 虽然有三个分量，只有两个独立约束。实现时必须做秩判断，不能把三维叉乘误差当成满秩 3D 约束直接求逆。
+
+点到线残差的几何分解可以写得更直观：
+
+```text
+r       = p_R - p0
+s       = u^T r                    # RCM 点沿工具轴方向的投影长度
+p_close = p0 + s * u                # 工具轴线上离 RCM 点最近的点
+e       = p_R - p_close             # RCM 横向残差
+d_RCM   = ||e||
+```
+
+其中 `s` 是 RCM 点投影到工具轴线上的轴向位置。这个值本身不是横向误差，但它可以用来判断 RCM 点是否落在有效直杆段内：
+
+```text
+lambda_min <= s <= lambda_max
+```
+
+如果 `d_RCM` 很小但 `s` 不在有效段内，说明 RCM 点落在工具轴线的无限延长线上，而不是落在真实工具直杆段上。这种情况不能判定为安全满足 RCM。
+
+数值例子：假设工具轴线为 z 轴：
+
+```text
+p0 = [0.0, 0.0, 0.0]
+u  = [0.0, 0.0, 1.0]
+```
+
+若 RCM 点为：
+
+```text
+p_R = [0.003, -0.004, 0.120]
+```
+
+则轴向投影：
+
+```text
+s = u^T (p_R - p0) = 0.120
+```
+
+横向残差：
+
+```text
+e = [0.003, -0.004, 0.0]
+d_RCM = sqrt(0.003^2 + 0.004^2) = 0.005 m
+```
+
+这个例子说明：RCM 点在工具轴方向上的深度是 120 mm，但真正危险的是横向偏差 5 mm。控制器应该优先让 `[0.003, -0.004]` 收敛到 0，而不是把 120 mm 当成误差消掉。
+
+实际计算时必须检查：
+
+- `u` 是否为单位向量，容差例如 `abs(||u|| - 1) < 1e-6` 或项目设定阈值。
+- `p0`、`u`、`p_R` 是否包含 NaN/Inf。
+- `d_RCM` 是否超过进入阈值或 fault 阈值。
+- `s` 是否在有效直杆段范围内。
+- `e` 的方向是否和有限差分或可视化结果一致。
+
+推荐把 `d_RCM` 至少分成三个区间：
+
+| 区间 | 含义 | 控制策略 |
+| --- | --- | --- |
+| `d_RCM <= entry_threshold` | 可进入或保持 RCM 控制 | 允许低速 active |
+| `entry_threshold < d_RCM <= fault_threshold` | 偏差偏大但未进入硬故障 | 降速、纠偏、禁止插入 |
+| `d_RCM > fault_threshold` | 入口横向误差不可接受 | HOLD/FAULT，不继续执行任务 |
+
+阈值不能凭感觉写死。应根据工具直径、入口机构间隙、传感器误差、机械臂重复定位精度、标定 RMS 和现场风险共同确定。
+
+### 5.4 工具几何和标定
+
+在法兰坐标系 `F` 中定义工具轴线：
+
+```text
+p0_F = 工具轴线上一个已知点
+u_F  = 工具轴方向单位向量
+```
+
+变换到基座坐标系 `B`：
+
+```text
+p0_B = R_BF * p0_F + p_F_B
+u_B  = R_BF * u_F
+```
+
+tool manifest 至少应记录：
 
 ```yaml
-controller_manager:
-  ros__parameters:
-    update_rate: 100
-    joint_state_broadcaster:
-      type: joint_state_broadcaster/JointStateBroadcaster
-    joint_trajectory_controller:
-      type: joint_trajectory_controller/JointTrajectoryController
-
-joint_trajectory_controller:
-  ros__parameters:
-    joints:
-      - joint1
-      - joint2
-      - joint3
-      - joint4
-      - joint5
-      - joint6
-    command_interfaces:
-      - position
-    state_interfaces:
-      - position
-      - velocity
-    allow_partial_joints_goal: false
-    constraints:
-      stopped_velocity_tolerance: 0.01
-      goal_time: 2.0
+tool_id: piper_tool_v1
+calibration_version: 2026-08-09_axis_a
+base_frame: base_link
+flange_frame: link6
+axis_frame: tool_axis
+tip_frame: tool_tip
+axis_point_flange_m: [0.0, 0.0, 0.12]
+axis_direction_flange: [0.0, 0.0, 1.0]
+lambda_min_m: 0.02
+lambda_max_m: 0.18
+fit_rms_m: REPLACE_WITH_MEASURED_VALUE
+source_bag: REPLACE_WITH_ROSBAG_OR_LOG
+operator: REPLACE_WITH_NAME
 ```
 
-PLANNED 示例：不要直接复制到 live arm。
+`lambda_min_m` 和 `lambda_max_m` 用来表示真实有效直杆段。RCM 点只落在数学无限延长线上不够，还必须落在真实工具有效段范围内。
 
-```xml
-<!-- URDF ros2_control snippet for future hardware plugin. -->
-<ros2_control name="PiperSystem" type="system">
-  <hardware>
-    <plugin>piper_control/PiperSystemHardware</plugin>
-    <param name="backend">mock</param>
-    <param name="can_interface">can0</param>
-    <param name="sdk_version">PIN_THIS_BEFORE_LIVE_USE</param>
-  </hardware>
-  <joint name="joint1">
-    <command_interface name="position" />
-    <state_interface name="position" />
-    <state_interface name="velocity" />
-  </joint>
-  <joint name="joint2">
-    <command_interface name="position" />
-    <state_interface name="position" />
-    <state_interface name="velocity" />
-  </joint>
-  <joint name="joint3">
-    <command_interface name="position" />
-    <state_interface name="position" />
-    <state_interface name="velocity" />
-  </joint>
-  <joint name="joint4">
-    <command_interface name="position" />
-    <state_interface name="position" />
-    <state_interface name="velocity" />
-  </joint>
-  <joint name="joint5">
-    <command_interface name="position" />
-    <state_interface name="position" />
-    <state_interface name="velocity" />
-  </joint>
-  <joint name="joint6">
-    <command_interface name="position" />
-    <state_interface name="position" />
-    <state_interface name="velocity" />
-  </joint>
-</ros2_control>
+工具几何建议拆成三个对象，不要混在一个 frame 里：
+
+| 对象 | 作用 | 例子 |
+| --- | --- | --- |
+| `tool_axis` | RCM 约束使用的功能轴线 | 针体中心线、镜管轴线、视觉光轴 |
+| `tool_tip` | 插入深度、工作点或可视化终点 | 针尖、镜头端点、探针端点 |
+| `tool_collision` | MoveIt/仿真碰撞外形 | 工具外壳、夹具、线缆保护件 |
+
+不规则工具也可以使用单一直线 RCM，只要真正受入口约束的是一条清晰的功能直线。例如工具外壳偏心、夹具形状复杂，但穿过入口的是一根直针或直镜管，就应把 `tool_axis` 定义为这根直线，而不是用 mesh 几何中心替代。
+
+不适合单一直线 RCM 的情况：
+
+- 入口接触的是弯曲段。
+- 工具是柔性导管，轴线随受力弯曲。
+- 工具有效约束不是线，而是面、锥、槽或多点机构。
+- 工具在夹具中有明显松动，法兰到工具轴线不是固定变换。
+
+标定工具轴线的常见思路：
+
+1. 固定工具，使工具功能轴尽量清晰可测。
+2. 采集多个姿态下工具上两个或多个可测点。
+3. 把测得点转换到法兰坐标系或基座坐标系。
+4. 用最小二乘拟合轴线方向 `u_F` 和轴上一点 `p0_F`。
+5. 计算拟合 RMS 和最大残差。
+6. 写入 tool manifest，并生成 calibration version。
+7. 用不同姿态复测，确认姿态变化不会引入系统偏差。
+
+轴线拟合的最小二乘直觉：给定一组工具轴上的测量点 `x_i`，先求中心点：
+
+```text
+x_bar = mean(x_i)
 ```
 
-PLANNED 示例：不要直接复制到 live arm。
+再对点云协方差做主方向分析，最大特征值对应的特征向量可作为轴线方向 `u`。拟合残差为每个点到拟合轴线的距离：
 
-```launch.py
-# launch.py snippet for planned controller manager bringup.
-from launch import LaunchDescription
-from launch_ros.actions import Node
-
-
-def generate_launch_description():
-    return LaunchDescription([
-        Node(
-            package="controller_manager",
-            executable="ros2_control_node",
-            parameters=[
-                {"robot_description": "REPLACE_WITH_ROBOT_DESCRIPTION"},
-                "config/piper_controllers.yaml",
-            ],
-            output="screen",
-        ),
-        Node(
-            package="controller_manager",
-            executable="spawner",
-            arguments=["joint_state_broadcaster"],
-            output="screen",
-        ),
-        Node(
-            package="controller_manager",
-            executable="spawner",
-            arguments=["joint_trajectory_controller"],
-            output="screen",
-        ),
-    ])
+```text
+d_i = ||(I - u u^T) (x_i - x_bar)||
+fit_rms = sqrt(mean(d_i^2))
 ```
 
-ros2_control 验收标准：
+工程上不一定必须在文档里实现这段算法，但必须保存：采样点来源、坐标系、拟合结果、RMS、最大误差、操作者、日期和原始日志。没有标定证据的工具轴线不能进入 live RCM。
 
-The mock backend builds on x86_64.
+标定验收建议：
 
-The mock backend builds on ARM64.
+| 项 | 要求 |
+| --- | --- |
+| `axis_direction_flange` | 必须归一化，方向定义清楚 |
+| `axis_point_flange_m` | 必须在工具轴线上，单位为 m |
+| `lambda_min_m/max_m` | 覆盖真实有效直杆段，不使用无限线替代 |
+| `fit_rms_m` | 小于项目 RCM 偏差预算的一部分 |
+| 复测姿态 | 至少覆盖中性位、偏转位、接近工作区边界 |
+| 标定版本 | 写入 command 和 status，防止工具换了但控制器不知道 |
 
-The mock backend passes controller manager launch tests.
+### 5.5 六轴机械臂的自由度预算
 
-The mock backend exposes six joints.
+单一直杆 RCM 中，轴线穿过固定点提供两个独立横向约束。完整工具任务通常还包括两个摆动自由度、一个插入自由度、一个滚转自由度。
 
-The mock backend rejects stale commands.
-
-The Piper backend remains disabled by default.
-
-The Piper backend requires explicit parameter `backend:=piper_sdk` or equivalent.
-
-The Piper backend logs read-only connection details before activation.
-
-The Piper backend fails closed on SDK errors.
-
-The Piper backend never writes in `on_init`.
-
-## 11. 二次开发模式（PLANNED）
-
-Secondary development should add small ROS nodes with explicit contracts.
-
-Do not let a convenience node become a hidden command path.
-
-Do not parse joystick strings in multiple places.
-
-Do not duplicate calibration loading in every node.
-
-Create shared message definitions only when the interface stabilizes.
-
-Keep parameters in YAML files.
-
-Keep test fixtures under the package that owns the behavior.
-
-Keep mock backends deterministic.
-
-Keep all real hardware writes behind lifecycle activation.
-
-PLANNED 示例：不要直接复制到 live arm。
-
-```python
-#!/usr/bin/env python3
-import rclpy
-from rclpy.node import Node
-from geometry_msgs.msg import Vector3
-from std_msgs.msg import String
-
-
-class RcmIntentMonitor(Node):
-    def __init__(self):
-        super().__init__("rcm_intent_monitor")
-        self.mode = "IDLE"
-        self.create_subscription(String, "/rcm_mode", self.on_mode, 10)
-        self.create_subscription(Vector3, "/rcm_cmd", self.on_cmd, 10)
-
-    def on_mode(self, msg: String) -> None:
-        self.mode = msg.data
-
-    def on_cmd(self, msg: Vector3) -> None:
-        if self.mode != "RCM_CONTROL":
-            return
-        self.get_logger().info(
-            f"intent pitch={msg.x:.4f} yaw={msg.y:.4f} insertion={msg.z:.4f}"
-        )
-
-
-def main() -> None:
-    rclpy.init()
-    node = RcmIntentMonitor()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
+```text
+2 个 RCM 横向约束 + 4 个工具任务自由度 = 6
 ```
 
-PLANNED 示例：不要直接复制到 live arm。
+对六轴 Piper 来说，这通常意味着没有额外冗余可以随意叠加肘部姿态、强避障、任意 TCP pose 等硬约束。工程上必须明确优先级：
 
-```cpp
-// C++ skeleton for a future controller that consumes typed RCM commands.
-#include "controller_interface/controller_interface.hpp"
-#include "rclcpp/rclcpp.hpp"
+1. 硬件安全和停止。
+2. RCM 横向误差。
+3. 关节限位和奇异性。
+4. 插入、摆动、滚转任务。
+5. 姿态偏好、平滑性、避障等二级目标。
 
-namespace piper_control
-{
+当目标不可同时满足时，应缩放、hold、replan 或 fault，而不是继续输出不可解释命令。
 
-class RcmController final : public controller_interface::ControllerInterface
-{
-public:
-  controller_interface::CallbackReturn on_init() override;
+为什么 RCM 横向约束是两个自由度：一条三维直线由方向 `u` 和轴上一点 `p0` 决定。一个空间点到这条线的误差有三维写法，但沿工具轴方向的分量不影响是否穿过入口。真正需要压住的是垂直于工具轴的两个方向，所以是两个独立约束。
 
-  controller_interface::InterfaceConfiguration command_interface_configuration() const override;
+六轴机械臂常见任务分解：
 
-  controller_interface::InterfaceConfiguration state_interface_configuration() const override;
+| 任务 | 自由度 | 说明 |
+| --- | ---: | --- |
+| RCM 横向约束 | 2 | 保证工具轴线穿过入口 |
+| pivot 摆动 | 2 | 改变工具方向，相当于绕 RCM 点摆动 |
+| insertion 插入 | 1 | 沿工具轴线进出 |
+| roll 滚转 | 1 | 绕工具轴线自转 |
+| 合计 | 6 | 刚好用满六轴能力 |
 
-  controller_interface::return_type update(
-    const rclcpp::Time & time,
-    const rclcpp::Duration & period) override;
-};
+这意味着六轴机械臂在严格 RCM 下通常没有冗余去同时满足很多额外目标。比如“工具轴过 RCM 点”“TCP 到某个任意 3D 点”“姿态完全对齐某个 3D 姿态”“肘部远离某个区域”“远离所有关节限位”这些要求同时出现时，系统可能不可行。
 
-}  // namespace piper_control
+可行性判断应在文档、UI 和代码里显式暴露：
+
+- 若 RCM 约束和插入任务冲突，优先保持 RCM，停止插入。
+- 若接近关节限位，降低 task scale 或要求重新规划 approach。
+- 若接近奇异，降低摆动速度或退出到安全姿态。
+- 若碰撞风险和 RCM 任务冲突，不要强行求解，应 hold/replan。
+
+不要把不可行问题伪装成“调大增益就能解决”。增益只能影响收敛速度，不能创造额外自由度。
+
+### 5.6 点雅可比和方向雅可比
+
+法兰速度：
+
+```text
+v_F     = J_v(q) * q_dot
+omega_F = J_w(q) * q_dot
 ```
 
-PLANNED 示例：不要直接复制到 live arm。
+工具轴线上点 `p = p_F + R_BF * r_F` 的速度：
+
+```text
+v_p = v_F + omega_F x (R_BF * r_F)
+J_p = J_v - skew(R_BF * r_F) * J_w
+```
+
+工具轴方向 `u = R_BF * u_F` 的变化：
+
+```text
+u_dot = omega_F x u
+J_u   = -skew(u) * J_w
+```
+
+工程实现时建议：
+
+- 先用有限差分做数值雅可比作为测试 oracle。
+- C++ 中实现解析或半解析雅可比。
+- 用至少三个姿态验证：中性位、接近限位、接近奇异。
+- 对低秩、NaN、Inf、单位向量不合法做显式失败。
+
+这里的核心问题是：`q_dot` 是关节速度，而 RCM 误差是工具轴线相对入口点的横向偏差。中间需要雅可比把“关节怎么动”映射成“工具轴线怎么动”。
+
+法兰 twist 可拆成线速度和角速度：
+
+```text
+twist_F = [ v_F ] = [ J_v(q) ] q_dot
+          [ w_F ]   [ J_w(q) ]
+```
+
+工具轴线上一点相对法兰有偏置 `r_B = R_BF * r_F`。当法兰转动时，这个偏置点不仅跟随法兰平移，还会因为角速度产生绕法兰的线速度：
+
+```text
+v_p = v_F + w_F x r_B
+```
+
+利用叉乘矩阵 `skew(a)`：
+
+```text
+skew(a) b = a x b
+```
+
+可以得到：
+
+```text
+w_F x r_B = -skew(r_B) w_F
+J_p = J_v - skew(r_B) J_w
+```
+
+工具轴方向只受角速度影响，不受法兰平移影响：
+
+```text
+u_dot = w_F x u = -skew(u) w_F
+J_u = -skew(u) J_w
+```
+
+有限差分验证方法：
+
+```text
+for each joint i:
+  q_plus  = q; q_plus[i]  += eps
+  q_minus = q; q_minus[i] -= eps
+
+  numeric_position_column = (p(q_plus) - p(q_minus)) / (2 * eps)
+  numeric_axis_column     = (u(q_plus) - u(q_minus)) / (2 * eps)
+
+  compare numeric_position_column with J_p.col(i)
+  compare numeric_axis_column with J_u.col(i)
+```
+
+测试要点：
+
+- `eps` 不能太大，否则非线性误差明显；也不能太小，否则浮点误差明显。
+- 对方向向量 `u` 做差分后，结果应接近垂直于 `u`，因为单位向量变化不应改变长度。
+- 接近奇异位姿时误差可能变大，但必须能检测并记录，不应静默通过。
+- 数值雅可比可以作为测试 oracle，不建议作为 live 高频控制的唯一实现。
+
+### 5.7 RCM 约束雅可比
+
+RCM 残差 `e` 是 `p0` 和 `u` 的函数，因此 `e_dot` 可以写成：
+
+```text
+e_dot = J_e(q) * q_dot
+```
+
+速度级 RCM 控制目标：
+
+```text
+J_e(q) * q_dot = -K * e
+```
+
+其中 `K` 是误差收敛增益。`K` 太大可能导致速度突变，太小会导致入口误差收敛慢。第一版建议在 mock 和仿真中保守选择，并把 `d_RCM`、`e_dot`、`task_scale`、`sigma_min` 输出到状态消息。
+
+从残差公式出发：
+
+```text
+e = P r
+P = I - u u^T
+r = p_R - p0
+```
+
+如果 RCM 点 `p_R` 在控制周期内固定，则：
+
+```text
+r_dot = -p0_dot
+P_dot = -(u_dot u^T + u u_dot^T)
+e_dot = P_dot r + P r_dot
+```
+
+代入 `p0_dot = J_p q_dot`、`u_dot = J_u q_dot` 后，可以得到 `J_e`。工程上可以先不手推完整解析式，而是按以下步骤推进：
+
+1. 用有限差分计算 `J_e_numeric`，验证方向和量级。
+2. 在 C++ 中实现解析或半解析 `J_e`。
+3. 单元测试比较 `J_e` 和 `J_e_numeric`。
+4. 检查 `rank(J_e)`，正常情况下 RCM 横向约束秩应为 2。
+5. 低秩、奇异或数值病态时返回 reason code，不继续求普通逆。
+
+RCM 约束速度目标通常是让误差指数收敛：
+
+```text
+e_dot_desired = -K * e
+```
+
+`K` 的单位接近 `1/s`。如果控制周期是 `dt`，粗略理解为每个周期把误差向 0 拉回一小部分。第一版应小增益、低速度，先证明方向正确，再提高响应。
+
+约束行选择也很重要。因为 `e` 在三维里只有两个独立方向，工程上常见做法包括：
+
+- 使用局部横向基底 `a`、`b`，其中 `a`、`b` 都垂直于 `u`，只控制 `[a^T e, b^T e]`。
+- 使用三维残差但通过 SVD/秩判断处理低秩，不对三维矩阵直接求普通逆。
+- 使用叉乘残差 `u x r`，同时明确它也是秩 2 约束。
+
+推荐第一版优先把状态输出做完整：
+
+```text
+d_RCM
+e_RCM[3]
+lambda_on_axis
+rank_J_e
+sigma_min
+condition_number
+task_scale
+solver_status
+reason_code
+```
+
+这些量比“机械臂动了”更重要，因为它们能证明动的是 RCM 约束，而不是普通末端控制。
+
+### 5.8 RCM 兼容任务：pivot、insertion、roll
+
+RCM 控制不应让上层直接发送任意 TCP 6D pose。更合适的是发送 RCM 兼容任务：
+
+| 任务 | 含义 | 对 RCM 的影响 |
+| --- | --- | --- |
+| `pivot` | 绕 RCM 点改变工具方向 | 需要保持工具轴线穿过 RCM 点 |
+| `insertion` | 沿工具轴线插入或退出 | 不应增加横向残差 |
+| `roll` | 绕工具轴线自转 | 理想情况下不改变 RCM 横向误差 |
+
+#### pivot 摆动
+
+pivot 不是让 TCP 在空间里任意移动，而是改变工具方向 `u_B`，同时让工具轴线仍穿过 `p_R_B`。可以理解为工具绕入口点转动。
+
+工程上常见输入可以是：
+
+```text
+pivot_velocity_x
+pivot_velocity_y
+```
+
+这两个速度应定义在一个和工具轴垂直的局部横向基底上，而不是随便用世界坐标 x/y。原因是工具方向变化始终发生在垂直于工具轴的两个自由度上。
+
+#### insertion 插入
+
+insertion 是沿工具轴线移动：
+
+```text
+v_insert = insertion_velocity * u_B
+```
+
+如果 `d_RCM` 已经超过进入阈值，应该先纠偏或 hold，不要继续插入。插入会增加入口接触风险，不能在 RCM 横向误差不可控时执行。
+
+#### roll 滚转
+
+roll 是绕工具轴线自转，角速度方向为 `u_B`：
+
+```text
+w_roll = roll_velocity * u_B
+```
+
+理论上 roll 不改变工具轴线位置，因此不应增加 RCM 横向误差。但真实机械臂中，如果工具轴线标定偏、夹具有偏心或 wrist 近奇异，roll 也可能引入横向扰动，所以仍需要 `d_RCM` 监控。
+
+任务优先级建议：
+
+1. RCM 横向误差约束。
+2. 关节限位、速度限制、奇异性和硬件安全。
+3. insertion 和 pivot 任务。
+4. roll 任务。
+5. 平滑性、姿态偏好等二级目标。
+
+不要把所有任务都当成同权重目标。六轴机械臂自由度有限，权重和优先级必须明确。
+
+### 5.9 DLS、QP 和约束求解
+
+低速原型可以先用阻尼最小二乘 DLS：
+
+```text
+q_dot = J^T (J J^T + lambda^2 I)^-1 v_task
+```
+
+DLS 适合验证公式和接口，不适合作为最终安全求解器。原因：它很难自然表达关节位置预测限制、速度限制、碰撞、入口禁区、任务缩放和故障原因。
+
+生产方向更适合 QP/LP/SNS 或等价约束求解器：
+
+```text
+minimize    ||J_task q_dot - v_task||^2 + w ||q_dot||^2
+subject to  q_dot_min <= q_dot <= q_dot_max
+            q_next_min <= q + q_dot * dt <= q_next_max
+            d_RCM_next <= threshold
+```
+
+关键点：不要先求出 `q_dot` 再逐关节硬裁剪。逐关节裁剪可能破坏 RCM 等式，让入口误差反而增大。正确做法是求解器内部约束或整体 task scale。
+
+#### DLS 适合做什么
+
+DLS 的优势是简单、稳定、容易写测试。它适合第一版 mock controller：
+
+- 验证 `J_task` 方向是否正确。
+- 验证 `d_RCM` 是否能下降。
+- 验证 message、状态机和日志字段是否完整。
+- 验证 singular 时阻尼是否避免速度爆炸。
+
+DLS 的基本输入输出：
+
+```text
+input:
+  J_task      # 任务雅可比
+  v_task      # 目标任务空间速度
+  lambda      # 阻尼
+  q_dot_limit # 关节速度限制
+
+output:
+  q_dot
+  task_scale
+  sigma_min
+  condition_number
+  solver_status
+  reason_code
+```
+
+DLS 里的 `lambda` 不是越大越好：
+
+| `lambda` | 现象 | 风险 |
+| --- | --- | --- |
+| 太小 | 接近奇异时速度很大 | 机械臂抖动或超过限制 |
+| 适中 | 稳定且能跟踪任务 | 需要测试调参 |
+| 太大 | 输出过于保守 | 响应慢，RCM 误差收敛慢 |
+
+#### 为什么生产方向更偏 QP
+
+真实机械臂控制不只是求一个数学上接近目标的 `q_dot`，还要满足许多硬约束：
+
+- 每个关节速度不能超限。
+- 下一周期预测关节位置不能越限。
+- RCM 残差不能超过阈值。
+- 接近奇异时要降速。
+- command 过期不能继续运动。
+- 碰撞或工作空间边界要阻止任务。
+
+这些约束更适合写进优化问题，而不是求解后补丁式处理。QP 可以把目标和约束分开：
+
+```text
+minimize:
+  ||J_rcm q_dot - v_rcm||^2
+  + w_insert ||J_insert q_dot - v_insert||^2
+  + w_roll ||J_roll q_dot - v_roll||^2
+  + w_smooth ||q_dot - q_dot_prev||^2
+
+subject to:
+  q_dot_min <= q_dot <= q_dot_max
+  q_min + margin <= q + q_dot * dt <= q_max - margin
+  task_scale_min <= task_scale <= 1
+```
+
+如果引入 `task_scale`，可以在任务不可完全满足时整体降速，而不是逐关节裁剪：
+
+```text
+J_task q_dot = task_scale * v_task
+0 <= task_scale <= 1
+```
+
+#### SNS / LP 思路
+
+SNS（Saturation in the Null Space）或 LP/QP 类方法的目标是处理关节速度饱和：当某个关节达到限制时，把它固定在允许边界，再在剩余自由度中继续求解任务。它比简单裁剪更可靠，因为它知道哪些关节已经饱和，并重新计算剩余任务。
+
+对本项目来说，第一版可以按以下路线：
+
+```text
+离线 Python 验证 DLS
+  -> C++ DLS mock controller
+  -> 加入速度/位置预测限制和 task_scale
+  -> 替换或扩展为 QP/SNS
+  -> HIL 只读验证状态和失败路径
+  -> 低能量 live
+```
+
+不要一开始就追求复杂求解器。先用 DLS 把几何、雅可比和接口打通，再用同一套测试集验证 QP/SNS 的改进。
+
+### 5.10 速度、滤波和流畅性
+
+机械臂运行是否流畅，不只取决于求解器，还取决于速度连续性、限幅方式和控制周期。理论上建议关注以下量：
+
+| 量 | 含义 | 建议 |
+| --- | --- | --- |
+| `q_dot` | 关节速度 | 有上限，不能突变 |
+| `q_ddot` | 关节加速度 | 用速度斜率限制间接控制 |
+| `task_scale` | 任务整体缩放 | 接近限制时平滑降低 |
+| `d_RCM` | RCM 横向误差 | 超阈值禁止插入 |
+| `sigma_min` | 最小奇异值 | 接近 0 时降速或 hold |
+| `condition_number` | 条件数 | 过大说明数值病态 |
+
+比逐关节硬裁剪更好的处理方式：
+
+```text
+1. 先在求解器中加入速度上下界。
+2. 若任务不可行，整体降低 task_scale。
+3. 对输出速度做斜率限制，避免周期间跳变。
+4. 接近奇异或限位时提前降速，而不是到边界才停。
+5. 输出 reason code，让用户知道是限位、奇异还是 RCM 超差。
+```
+
+理论上，速度连续比位置点连续更重要。很多机械臂抖动不是因为路径点错，而是因为相邻周期速度方向和大小变化太突然。
+
+### 5.11 奇异、限位和不可行任务
+
+奇异位姿下，小的任务空间速度可能需要很大的关节速度才能实现。DLS、QP 和 task scale 都是在处理这个问题，但它们不能改变机械臂本身的几何限制。
+
+奇异风险指标：
+
+```text
+sigma_min(J_task) 很小
+condition_number(J_task) 很大
+q_dot_norm 远大于 v_task_norm
+task_scale 被压得很低
+```
+
+限位风险不仅看当前 `q`，还要看下一周期预测：
+
+```text
+q_next = q + q_dot * dt
+```
+
+如果 `q_next` 会进入限位 margin，求解器应该降低或禁止该方向速度。不要等关节已经越限后再 fault。
+
+不可行任务例子：
+
+- 用户要求继续插入，但 RCM 横向误差已经超过 fault threshold。
+- 工具接近奇异位姿，pivot 方向需要极大 wrist 速度。
+- 关节接近限位，任务要求继续往限位方向运动。
+- MoveIt 给出的 approach pose 和当前 RCM 点几何上不兼容。
+
+不可行不是 bug。真正的 bug 是系统明明不可行，却继续输出看似正常的命令。
+
+### 5.12 求解失败怎么处理
+
+必须区分两类失败：
+
+| 类型 | 例子 | 处理 |
+| --- | --- | --- |
+| 任务不可行 | 目标速度太大、接近限位、奇异、约束冲突 | task scale、hold、replan、retract |
+| 系统不可信 | feedback 过期、TF 缺失、SDK error、tool mismatch、watchdog timeout | 进入 `FAULT` 或 fail-closed |
+
+禁止做法：
+
+- solver 失败后沿用上一条非零命令。
+- RCM 残差增长时继续插入。
+- 用默认零位或全零反馈替代读取失败。
+- 用普通 TCP pose 控制假装满足 RCM。
+
+正确日志至少包含：`q`、`q_dot`、`d_RCM`、`sigma_min`、`condition_number`、`solver_status`、`reason_code`、输入 command timestamp、feedback timestamp 和 active constraints。
+
+失败处理建议按优先级执行：
+
+```text
+1. 输入不可信：直接 HOLD/FAULT
+   - command stale
+   - feedback stale
+   - TF missing
+   - tool/calibration mismatch
+   - SDK/CAN error
+
+2. 几何不安全：禁止继续任务
+   - d_RCM > fault_threshold
+   - RCM 点不在有效直杆段
+   - 工具轴线无效或未标定
+
+3. 求解不可行：降速或 HOLD
+   - singularity near
+   - joint limit near
+   - QP infeasible
+
+4. 任务可行但风险升高：缩放任务
+   - task_scale < 1
+   - 降低 pivot/insertion/roll 速度
+```
+
+状态转换建议：
+
+| 条件 | 状态动作 | 输出 |
+| --- | --- | --- |
+| command 过期 | `HOLD` | 零速度或保持目标，reason=`COMMAND_STALE` |
+| feedback 过期 | `FAULT` 或 fail-closed | 不继续估计，reason=`FEEDBACK_STALE` |
+| `d_RCM` 超进入阈值 | 不进入 `RCM_ACTIVE` | reason=`RCM_ERROR_HIGH` |
+| `d_RCM` 超 fault 阈值 | `FAULT` | stop action，保存日志 |
+| solver infeasible | `HOLD` | reason=`SOLVER_INFEASIBLE` |
+| 接近奇异 | 降速或 `HOLD` | reason=`SINGULARITY_NEAR` |
+| 接近关节限位 | task scale 或 `HOLD` | reason=`JOINT_LIMIT_NEAR` |
+
+### 5.13 理论到实现前的最小检查题
+
+进入第 6 章写 C++ controller 前，应能回答下面问题：
+
+- `p_R_B` 从哪里来？坐标系、时间戳、标定版本是什么？
+- `p0_F` 和 `u_F` 怎么得到？是否有 RMS 和有效直杆段？
+- `d_RCM` 的进入阈值和 fault 阈值是多少？依据是什么？
+- `J_p`、`J_u`、`J_e` 如何用有限差分验证？
+- 六轴机械臂当前任务是否可行？哪些目标是硬约束，哪些是软目标？
+- DLS 输出被限速时，是否仍能解释 RCM 等式是否满足？
+- QP/SNS 不可行时，状态机进入 HOLD 还是 FAULT？
+- 哪些 reason code 会阻止进入 `RCM_ACTIVE`？
+
+如果这些问题答不上来，就先不要写 live 控制代码。可以继续做离线数学、mock、可视化和测试，但不能接真机 command owner。
+
+### 5.14 推荐理论测试集
+
+理论进入代码前，至少准备以下测试：
+
+| 测试 | 输入 | 期望 |
+| --- | --- | --- |
+| 点在线上 | `p_R = p0 + lambda * u` | `d_RCM = 0` |
+| 点横向偏移 | `u=[0,0,1]`，`p_R=[x,y,z]` | `d_RCM=sqrt(x^2+y^2)` |
+| 非单位方向 | `u=[0,0,2]` | 拒绝或归一化并记录 |
+| 有效段外 | `lambda < lambda_min` | 不允许进入 active |
+| 雅可比有限差分 | 多个 `q` 姿态 | 解析和数值误差小于阈值 |
+| 接近奇异 | `sigma_min` 很小 | 降速或 reason=`SINGULARITY_NEAR` |
+| 接近限位 | `q_next` 越过 margin | task scale 或 HOLD |
+| solver 不可行 | 约束冲突 | reason=`SOLVER_INFEASIBLE` |
+
+这些测试不需要真机。它们应该先在离线数学和 C++ 单元测试中通过，再进入 mock ROS，再进入仿真和只读硬件。
+
+---
+
+## 6. 功能包：`agx_arm_controller`
+
+### 6.1 作用和边界
+
+`agx_arm_controller` 是 RCM 控制核心包。它应优先用 C++ 实现，原因是它位于控制闭环中，需要稳定周期、明确异常路径、较低延迟和可单元测试的数学库。
+
+它应该放：
+
+| 内容 | 说明 |
+| --- | --- |
+| C++ RCM 数学库 | FK/Jacobian 接口、工具轴、RCM 残差、求解器 |
+| 重力补偿模型 | 机器人自身重力、工具载荷、输出限幅和 mock/sim 验证 |
+| 状态机 | `DISABLED`、`READY`、`RCM_ACTIVE`、`HOLD`、`FAULT` |
+| ROS wrapper | 订阅 command/joint state，发布 status/candidate command |
+| 参数 | frame、阈值、速度限制、solver 参数、tool manifest 路径 |
+| 测试 | 数学单元测试、状态机测试、ROS contract 测试 |
+
+它不应该放：
+
+- Piper SDK/CAN 直接调用。
+- rcm_teleop 低层按钮解析。
+- MoveIt 配置文件。
+- MuJoCo 模型。
+- 真机写命令最终下发逻辑。
+
+### 6.2 推荐目录
+
+```text
+src/agx_arm_controller/
+├── include/agx_arm_controller/
+│   ├── kinematics_model.hpp
+│   ├── tool_model.hpp
+│   ├── gravity_compensator.hpp
+│   ├── rcm_constraint_model.hpp
+│   ├── velocity_optimizer.hpp
+│   ├── safety_supervisor.hpp
+│   └── rcm_controller_node.hpp
+├── src/
+│   ├── kinematics_model.cpp
+│   ├── tool_model.cpp
+│   ├── gravity_compensator.cpp
+│   ├── rcm_constraint_model.cpp
+│   ├── velocity_optimizer.cpp
+│   ├── safety_supervisor.cpp
+│   └── rcm_controller_node.cpp
+├── config/
+│   └── rcm_controller.yaml
+├── launch/
+│   └── rcm_controller_mock.launch.py
+└── test/
+    ├── test_rcm_error.cpp
+    ├── test_gravity_compensator.cpp
+    ├── test_jacobian.cpp
+    ├── test_velocity_optimizer.cpp
+    └── test_state_machine.cpp
+```
+
+### 6.3 一步步编写 C++ 控制器
+
+第 1 步：先写纯 C++ library，不启动 ROS。
+
+优先实现：
+
+```text
+ToolModel
+  - 加载 tool manifest
+  - 检查单位向量、有效轴段、tool_id、calibration_version
+
+RCMConstraintModel
+  - computeError(p0, u, pivot)
+  - computeDistance(error)
+  - computeConstraintJacobian(state, tool)
+
+VelocityOptimizer
+  - solve(task, bounds)
+  - 返回 q_dot、task_scale、sigma_min、status、reason_code
+
+SafetySupervisor
+  - 检查 command/feedback/TF/tool/watchdog
+  - 管理状态机和 fault latch
+```
+
+第 2 步：给数学库写测试。
+
+先测不依赖 ROS 的函数：
+
+| 测试 | 目的 | 失败路径 |
+| --- | --- | --- |
+| `test_rcm_error.cpp` | 点到线残差正确 | 非单位向量、NaN、pivot 不合法 |
+| `test_jacobian.cpp` | 点/方向雅可比正确 | 有限差分误差超限 |
+| `test_velocity_optimizer.cpp` | DLS/QP 输出可解释 | singular、limit、infeasible |
+| `test_state_machine.cpp` | 状态转换正确 | timeout、tool mismatch、watchdog timeout |
+
+第 3 步：再写 ROS node wrapper。
+
+ROS wrapper 只做：
+
+```text
+参数读取
+订阅 RCMCommand
+订阅 joint state 或 mock feedback
+调用 C++ 数学库
+发布 RCMStatus
+发布 candidate command 给 command owner 或 mock sink
+```
+
+不要把 RCM 公式直接写在 callback 里。callback 应只收集输入，控制 tick 中读取缓存并执行固定顺序。
+
+第 4 步：加状态机。
+
+推荐状态：
+
+```text
+DISABLED
+  -> SELF_CHECK
+  -> READY
+  -> APPROACH_RCM
+  -> RCM_ACTIVE
+  -> HOLD / RETRACT / FAULT
+```
+
+进入 `RCM_ACTIVE` 前必须检查：
+
+- joint feedback 新鲜。
+- command 新鲜。
+- TF 完整。
+- tool ID 和 calibration version 匹配。
+- `d_RCM` 小于进入阈值。
+- solver 可行。
+- operator enable 和 watchdog 有效。
+
+第 5 步：只在 mock 中跑通。
+
+第一版 controller 不接真实 SDK。用 mock joint state、固定 tool manifest、固定 RCM 点和低速 command 验证状态消息、残差趋势和失败路径。
+
+### 6.4 推荐参数
 
 ```yaml
 rcm_controller:
   ros__parameters:
-    command_topic: "/rcm_cmd_typed"
-    calibration_file: "config/piper_calibration.yaml"
-    command_timeout_s: 0.10
-    max_pitch_rad: 0.35
-    max_yaw_rad: 0.35
-    max_insertion_m: 0.08
-    max_joint_velocity_rad_s: 0.30
-    require_deadman: true
-    backend: "mock"
+    base_frame: base_link
+    flange_frame: link6
+    command_timeout_sec: 0.10
+    feedback_timeout_sec: 0.05
+    gravity_compensation_enabled: false
+    gravity_vector_base_mps2: [0.0, 0.0, -9.80665]
+    tool_payload_mass_kg: 0.0
+    tool_payload_com_tool_m: [0.0, 0.0, 0.0]
+    max_gravity_torque_nm: [2.0, 2.0, 2.0, 1.0, 1.0, 1.0]
+    max_gravity_torque_rate_nmps: [5.0, 5.0, 5.0, 2.0, 2.0, 2.0]
+    rcm_entry_threshold_m: 0.002
+    rcm_fault_threshold_m: 0.005
+    max_insertion_velocity_mps: 0.005
+    max_roll_velocity_radps: 0.05
+    max_joint_velocity_radps: [0.05, 0.05, 0.05, 0.05, 0.05, 0.05]
+    damping_lambda: 0.01
+    min_sigma: 0.02
+    tool_manifest_path: "REPLACE_WITH_TOOL_YAML"
+    hardware_write_enabled: false
 ```
 
-测试策略：
+默认 `hardware_write_enabled` 必须是 `false`。controller 本身也不应该直接写 SDK；该字段只用于防止 launch 参数误解和状态显示。
 
-Unit-test parameter parsing.
+默认 `gravity_compensation_enabled` 也必须是 `false`。只有模型、动力学参数、工具载荷、输出限幅、mock/sim 验证和 H gate 都满足时，才能把重力补偿从计算结果推进到真实候选命令。
 
-Unit-test missing calibration rejection.
-
-Unit-test stale command rejection.
-
-Unit-test invalid mode rejection.
-
-Unit-test axis sign conversion.
-
-Unit-test limit clipping or rejection policy.
-
-Integration-test topic flow with mock nodes.
-
-Launch-test controller manager startup.
-
-Simulation-test a nominal RCM command sequence.
-
-HIL-test only after mock and simulation pass.
-
-## 12. 重力补偿（RESEARCH）
-
-重力补偿 means computing torques or commands that counteract gravity at the current robot configuration.
-
-当前仓库没有实现重力补偿。
-
-手柄 `GRAVITY_COMP` 只是 mode label。
-
-真正的重力补偿需要 dynamic model。
-
-True gravity compensation needs link masses.
-
-True gravity compensation needs center-of-mass locations.
-
-True gravity compensation needs inertia tensors.
-
-True gravity compensation needs motor-side or joint-side torque semantics.
-
-True gravity compensation needs friction treatment.
-
-True gravity compensation needs gear ratio treatment.
-
-True gravity compensation needs gravity vector orientation.
-
-True gravity compensation needs torque limits.
-
-True gravity compensation needs rate limits.
-
-True gravity compensation needs a verified safety stop.
-
-True gravity compensation needs model validation before live use.
-
-Pinocchio route uses URDF plus inertial properties to compute `rnea(q, v=0, a=0)`.
-
-KDL route uses a chain dynamics solver and gravity vector.
-
-Both routes require correct inertial tags.
-
-The current URDF should be audited for inertial completeness before dynamics.
-
-If inertial properties are missing or approximate, gravity compensation remains RESEARCH.
-
-If vendor firmware exposes gravity compensation internally, treat activation as RESEARCH until documented.
-
-Mock tests must run first.
-
-Simulation tests must run second.
-
-HIL tests must run third.
-
-Live arm tests must use reduced torque limits and physical emergency stop.
-
-PLANNED 示例：不要直接复制到 live arm。
-
-```python
-#!/usr/bin/env python3
-# Pinocchio-style gravity vector skeleton.
-import numpy as np
-
-
-def compute_gravity_torque(model, data, q: np.ndarray) -> np.ndarray:
-    if q.shape != (model.nq,):
-        raise ValueError("configuration size mismatch")
-    v = np.zeros(model.nv)
-    a = np.zeros(model.nv)
-    # tau = pinocchio.rnea(model, data, q, v, a)
-    tau = np.zeros(model.nv)
-    return tau
-
-
-def clamp_torque(tau: np.ndarray, limit: np.ndarray) -> np.ndarray:
-    return np.clip(tau, -limit, limit)
-```
-
-PLANNED 示例：不要直接复制到 live arm。
+### 6.5 C++ 接口示意
 
 ```cpp
-// C++ skeleton for future gravity compensation service logic.
-#include <array>
-#include <stdexcept>
-
-namespace piper_control
-{
-
-struct GravityCompensationInput
-{
-  std::array<double, 6> q_rad;
+// PLANNED：文档示意，不代表当前仓库已经实现。
+struct RCMError {
+  Eigen::Vector3d vector_m;
+  double distance_m;
+  bool valid;
+  std::string reason_code;
 };
 
-struct GravityCompensationOutput
-{
-  std::array<double, 6> tau_nm;
-  bool model_valid;
+struct VelocitySolution {
+  Eigen::VectorXd q_dot_radps;
+  double task_scale;
+  double sigma_min;
+  double condition_number;
+  SolverStatus status;
+  std::string reason_code;
 };
 
-GravityCompensationOutput computeGravityCompensation(
-  const GravityCompensationInput & input)
-{
-  (void) input;
-  GravityCompensationOutput output{};
-  output.model_valid = false;
-  return output;
+class RCMConstraintModel {
+ public:
+  RCMError computeError(
+      const Eigen::Vector3d& axis_point_base,
+      const Eigen::Vector3d& axis_direction_base_unit,
+      const Eigen::Vector3d& pivot_base) const;
+
+  Eigen::MatrixXd computeJacobian(
+      const RobotState& state,
+      const ToolModel& tool) const;
+};
+```
+
+### 6.6 重力补偿教程
+
+重力补偿不是 `rcm_teleop` 中的 `GRAVITY_COMP` 字符串本身。当前输入包只能表达“操作者请求进入重力补偿相关模式”。真正的重力补偿属于 controller、动力学模型、command owner 和硬件接口共同约束下的 `PLANNED` 能力。
+
+本项目中建议把重力补偿分成四层推进：
+
+| 层级 | 名称 | 允许做什么 | 禁止做什么 |
+| --- | --- | --- | --- |
+| L0 | dry-run mode label | `rcm_teleop` 发布 `GRAVITY_COMP`，用于观察状态流 | 宣称机械臂已被重力补偿 |
+| L1 | 离线 / mock 计算 | 在 C++ library 中计算 `tau_g(q)`，写单元测试和日志 | 接真机写控制 |
+| L2 | 仿真 / replay 验证 | 在 `/sim` 或 rosbag replay 中比较力矩趋势和限幅行为 | 把仿真成功当作真机安全证据 |
+| L3 | 低能量真机候选命令 | 只在 H0-H8 通过后，由 command owner 限幅、限速、watchdog 后输出 | controller 直接调用 SDK/CAN |
+
+#### 目标和非目标
+
+重力补偿的目标是在已知关节角和工具载荷的情况下，估计抵消重力所需的关节力矩：
+
+```text
+tau_g(q) = inverse_dynamics(q, q_dot=0, q_ddot=0, gravity)
+```
+
+如果第一版暂时没有完整动力学库，也可以先只做 mock 输出和接口验证，但不能把“保持当前位置”“低速位置伺服”“厂商 teach mode”混称为自研重力补偿。
+
+它不是：
+
+- 不是 RCM 约束求解器。
+- 不是阻抗控制。
+- 不是碰撞检测。
+- 不是硬件急停。
+- 不是让机械臂自由拖动的完整拖拽示教系统。
+
+#### 前置条件
+
+进入 L1 之前必须有：
+
+- URDF 或独立动力学参数中有可信的 link mass、center of mass、inertia。
+- joint order、joint direction、单位和 feedback timestamp 已经和 description 对齐。
+- 工具载荷 `tool_payload_mass_kg` 和 `tool_payload_com_tool_m` 有默认值，并能在 tool manifest 中覆盖。
+- 重力方向 `gravity_vector_base_mps2` 和 `base_link` 姿态约定清楚。
+- 输出单位明确是 Nm、current、vendor normalized value，三者不能混用。
+
+进入 L3 之前还必须确认 Piper SDK/CAN 是否真的提供可控的 torque/current/gravity/teach 接口。如果厂商接口只支持位置或速度命令，第一版不能输出自研 `tau_g` 到硬件，只能使用厂商明确支持的安全模式，或者停留在 mock/sim。
+
+#### 推荐内部接口
+
+```cpp
+// PLANNED：文档示意，不代表当前仓库已经实现。
+struct GravityCompInput {
+  RobotState state;
+  ToolPayload payload;
+  Eigen::Vector3d gravity_base_mps2;
+  rclcpp::Time stamp;
+};
+
+struct GravityCompOutput {
+  Eigen::VectorXd tau_g_nm;
+  Eigen::VectorXd tau_limited_nm;
+  bool valid;
+  std::string reason_code;
+};
+
+class GravityCompensator {
+ public:
+  GravityCompOutput compute(const GravityCompInput& input) const;
+};
+```
+
+第一版只要求 `compute()` 是纯函数：输入相同，输出相同；不读 ROS 参数、不访问文件、不调用 SDK。ROS wrapper 在控制 tick 外加载参数，在控制 tick 内只传入缓存好的 `RobotState` 和 `ToolPayload`。
+
+#### 一步步实现
+
+第 1 步：确认动力学来源。
+
+优先顺序：
+
+1. 厂商提供的 link mass / COM / inertia 对表。
+2. 已验证 URDF inertial 字段。
+3. 仿真模型中的 inertial 字段。
+4. 暂时 mock 参数。
+
+如果只能用 mock 参数，文档和状态必须标为 `PLANNED/mock`，不能作为真机依据。
+
+第 2 步：写纯 C++ 重力补偿库。
+
+推荐输出 `tau_g_nm` 和 `tau_limited_nm` 两组值。前者用于诊断，后者才允许进入候选命令链路。限幅和限速必须逐关节配置，不能用一个全局魔法数覆盖全部关节。
+
+第 3 步：补单元测试。
+
+最小测试集：
+
+| 测试 | 目的 | 通过标准 |
+| --- | --- | --- |
+| `zero_payload` | 无工具载荷时只计算机械臂自身重力 | 输出有限、维度等于 joint 数 |
+| `payload_scaling` | 工具质量增加后力矩趋势合理 | 相关关节力矩随质量单调变化 |
+| `gravity_direction_flip` | 重力方向反转时符号变化可解释 | 主要力矩项符号反转或接近反转 |
+| `limit_and_rate` | 限幅、限速生效 | 输出不超过配置边界 |
+| `invalid_state` | NaN、维度错误、过期反馈 fail-closed | `valid=false` 且有 reason code |
+
+第 4 步：接入 controller 状态机。
+
+建议状态流：
+
+```text
+DISABLED
+  -> SELF_CHECK
+  -> READY
+  -> GRAVITY_COMP_READY
+  -> GRAVITY_COMP_ACTIVE
+  -> HOLD / FAULT
+```
+
+进入 `GRAVITY_COMP_ACTIVE` 前必须检查：
+
+- `gravity_compensation_enabled=true`。
+- feedback 新鲜。
+- tool payload 和 calibration version 匹配。
+- 关节位置在软限位内。
+- operator enable 有效。
+- command owner 已进入低能量授权状态。
+- 输出 `tau_limited_nm` 没有 NaN、没有超限、没有过快跳变。
+
+第 5 步：只发布候选命令，不直接写硬件。
+
+controller 只能发布 candidate gravity command 或 status。真正写硬件的节点仍然是 command owner。command owner 必须重新检查 timestamp、enable、限幅、限速和 fault latch。
+
+第 6 步：先 mock，再 sim/replay，再只读硬件，再低能量。
+
+顺序不能反：
+
+```text
+unit test
+  -> mock joint state
+  -> /sim replay
+  -> SDK/CAN read-only 对比反馈
+  -> 单关节低能量
+  -> 多关节低能量
+  -> 与 RCM_ACTIVE 状态联调
+```
+
+#### 和 RCM 的关系
+
+RCM 控制解决“运动方向和约束”的问题；重力补偿解决“静态重力负载”的问题。两者可以在 candidate command 层组合，但必须先分别验证。
+
+推荐组合顺序：
+
+```text
+RCM solver 产生 q_dot 或小步目标
+gravity compensator 产生 tau_g
+safety supervisor 检查状态、限幅和优先级
+command owner 根据当前硬件模式选择实际下发接口
+```
+
+如果硬件当前只运行位置控制，`tau_g` 只能作为 diagnostics 或 feedforward 计划值，不应强行转换成位置偏移。只有硬件接口明确支持力矩、电流或厂商重力模式时，才允许进入写控制评审。
+
+#### 故障和停止条件
+
+以下情况必须进入 `HOLD` 或 `FAULT`：
+
+- feedback timeout。
+- joint order 或 joint count 不匹配。
+- `tau_g_nm` 出现 NaN/Inf。
+- 力矩超出逐关节限幅。
+- 力矩变化率超出逐关节限速。
+- 工具载荷未知或 calibration version 不匹配。
+- SDK/CAN 返回模式不支持或写入失败。
+- 操作者松开 enable，或急停/安全监督触发。
+
+#### 最小验收标准
+
+- 单元测试覆盖维度、符号、payload、限幅、限速和异常输入。
+- mock launch 中能看到 `GRAVITY_COMP_READY`、`GRAVITY_COMP_ACTIVE`、`HOLD/FAULT` 转换。
+- diagnostics 同时记录 `tau_g_nm`、`tau_limited_nm`、payload、gravity vector 和 reason code。
+- 未通过 H8 前，没有任何真实 SDK/CAN 写控制。
+- 低能量真机测试必须有人看护，有急停方案，有 rosbag 和现场记录。
+
+### 6.7 控制 tick 顺序
+
+```cpp
+// PLANNED：控制周期伪代码。
+void RCMController::update(const rclcpp::Time& now) {
+  const auto command = command_buffer_.latest();
+  const auto feedback = feedback_buffer_.latest();
+
+  const auto input_status = safety_.validateInputs(now, command, feedback, tool_model_);
+  if (!input_status.ok()) {
+    publishHoldStatus(input_status.reason_code);
+    return;
+  }
+
+  const auto robot_state = kinematics_.update(feedback.joint_state);
+
+  if (command.mode == Mode::GRAVITY_COMP) {
+    const auto gravity = gravity_compensator_.compute(
+        {robot_state, tool_model_.payload(), gravity_base_, now});
+    if (!gravity.valid) {
+      publishHoldStatus(gravity.reason_code);
+      return;
+    }
+    publishCandidateGravityCommand(gravity.tau_limited_nm);
+    publishGravityStatus(gravity);
+    return;
+  }
+
+  const auto axis = tool_model_.axisInBase(robot_state);
+  const auto rcm_error = rcm_model_.computeError(axis.point, axis.direction, command.pivot_base);
+
+  const auto guard = safety_.evaluateRcmGuards(rcm_error, robot_state);
+  if (!guard.ok()) {
+    publishHoldStatus(guard.reason_code);
+    return;
+  }
+
+  const auto task = task_adapter_.toVelocityTask(command, axis, rcm_error);
+  const auto solution = optimizer_.solve(robot_state, task, bounds_);
+
+  if (!solution.ok()) {
+    publishHoldStatus(solution.reason_code);
+    return;
+  }
+
+  publishCandidateCommand(solution);
+  publishStatus(rcm_error, solution);
 }
-
-}  // namespace piper_control
 ```
 
-重力补偿验收标准：
+控制周期内不要读 YAML、不要做文件 I/O、不要阻塞等待 TF、不要调用 SDK、不要打印大量日志。大量日志交给低频 diagnostics 或 rosbag。
 
-The dynamic model includes mass, CoM, and inertia for every moving link.
+### 6.8 验收标准
 
-The gravity vector sign is verified in simulation.
+- `computeError()` 正负例通过。
+- `GravityCompensator::compute()` 对 payload、重力方向、限幅、异常输入有测试。
+- 雅可比有限差分测试通过。
+- solver 对 singular、limit、infeasible 有 reason code。
+- 状态机对 command timeout、feedback timeout、tool mismatch、watchdog timeout、gravity output invalid 有确定转换。
+- mock launch 不接硬件也能发布 `RCMStatus`。
+- controller 源码中没有 SDK/CAN include。
 
-The torque vector sign is verified against known poses.
+---
 
-The torque vector is bounded.
+## 7. 功能包：`agx_arm_moveit_config`
 
-The controller exits on stale joint state.
+### 7.1 作用和边界
 
-The controller exits on missing model.
+`agx_arm_moveit_config` 用于 MoveIt 2 配置、规划、碰撞场景、fake execution 和 RViz MotionPlanning。它不是 RCM 闭环控制器，也不能绕过 command owner 执行真机写控制。
 
-SDK write failure 时 controller 必须退出或 fail-closed。
+适合做：
 
-The controller exits on emergency stop.
+- 进入 RCM 前的 approach pose。
+- 退出 RCM 后的 retract pose。
+- 碰撞模型和 planning scene 检查。
+- fake controller 可视化。
+- 离线路径审查。
 
-The controller is validated in mock.
+不适合直接做：
 
-The controller is validated in simulation.
+- `RCM_ACTIVE` 内严格入口约束。
+- 真机 command owner。
+- SDK/CAN 写控制。
 
-The controller is validated in HIL.
+### 7.2 一步步生成 MoveIt 配置
 
-The controller is reviewed before live arm activation.
+前置条件：`agx_arm_description` 已经能安装和显示，joint limit、tool collision、tool frame 初版稳定。
 
-## 13. RCM 控制设计（RESEARCH/PLANNED）
+第 1 步：使用 MoveIt Setup Assistant 生成配置。
 
-RCM means Remote Center of Motion.
-
-For this project, RCM means the tool axis should pass through a fixed point in space.
-
-The fixed point is usually the trocar or entry point.
-
-The tool axis must be calibrated.
-
-The TCP must be calibrated.
-
-The flange-to-tool transform must be calibrated.
-
-The base-to-RCM point must be calibrated.
-
-RCM applies only to an already calibrated 有效直杆 tool-axis segment.
-
-The RCM point must lie within the allowed range of that effective straight segment and must not be accepted on the 无限延长线 outside the calibrated segment.
-
-Curved, flexible, non-rigid, multi-segment, non-axisymmetric, eccentric-clamp, or complex end-effector tools must not be declared RCM-compliant with a single straight-axis model unless a separate model and validation evidence are approved.
-
-软件 RCM 不是硬件安全屏障; it cannot replace mechanical limits, physical emergency stop, fixture constraints, supervisor ownership, or low-energy HIL/live gates.
-
-The current repository does not implement this solver.
-
-The current `/rcm_cmd` message represents pitch, yaw, and insertion intent only.
-
-A future solver should transform pitch, yaw, and insertion intent into joint targets.
-
-A future solver should enforce the RCM point geometrically.
-
-A future solver should enforce joint limits.
-
-A future solver should enforce velocity limits.
-
-A future solver should enforce acceleration limits.
-
-A future solver should enforce singularity handling.
-
-A future solver should enforce collision constraints when available.
-
-Tool calibration formula:
-
-Let `p_r` be the RCM point in base frame.
-
-Let `p_t(q)` be a point on the tool axis in base frame.
-
-Let `a_t(q)` be the unit tool axis in base frame.
-
-The point-to-line residual is `e = (I - a_t a_t^T) (p_r - p_t)`.
-
-The RCM constraint target is `e = 0`.
-
-The telecentric deviation metric is the residual norm `||e||`.
-
-The residual 阈值 is `rcm_residual_threshold_m`, frozen by safety and math review before HIL/live use.
-
-If `||e||` exceeds `rcm_residual_threshold_m` for `rcm_residual_max_ticks`, the controller enters `HOLD`, stops sending new targets, and logs reason code `RCM_RESIDUAL_THRESHOLD_EXCEEDED`.
-
-If `||e||` keeps an increasing trend for `rcm_residual_divergence_ticks`, the controller enters `HOLD`; if recovery does not reduce residual before timeout, it enters `FAULT`, stops sending new targets, and logs reason code `RCM_RESIDUAL_DIVERGING`.
-
-DLS means damped least squares.
-
-DLS can solve small joint increments from task residuals.
-
-DLS should increase damping near singularities.
-
-QP means quadratic programming.
-
-QP can handle joint limits and inequality constraints directly.
-
-DLS is simpler for early mock validation.
-
-QP is better for bounded live behavior after solver review.
-
-If the DLS/QP solver is infeasible, the Jacobian is singular, constraints conflict, or the residual does not decrease after a bounded step, the controller enters `HOLD` or `FAULT`, stops sending new targets, and records a reason code such as `SOLVER_INFEASIBLE`, `JACOBIAN_SINGULAR`, `CONSTRAINT_CONFLICT`, or `RESIDUAL_NOT_DESCENDING`.
-
-PLANNED 示例：不要直接复制到 live arm。
-
-```python
-#!/usr/bin/env python3
-import numpy as np
-
-
-def point_to_line_residual(p_rcm: np.ndarray, p_tool: np.ndarray, axis: np.ndarray) -> np.ndarray:
-    axis = axis / np.linalg.norm(axis)
-    projector = np.eye(3) - np.outer(axis, axis)
-    return projector @ (p_rcm - p_tool)
-
-
-def damped_least_squares_step(jacobian: np.ndarray, residual: np.ndarray, damping: float) -> np.ndarray:
-    lhs = jacobian @ jacobian.T + (damping ** 2) * np.eye(jacobian.shape[0])
-    return jacobian.T @ np.linalg.solve(lhs, residual)
-
-
-def solve_rcm_increment(jacobian: np.ndarray, residual: np.ndarray) -> np.ndarray:
-    damping = 0.05
-    dq = damped_least_squares_step(jacobian, residual, damping)
-    return np.clip(dq, -0.02, 0.02)
+```bash
+ros2 launch moveit_setup_assistant setup_assistant.launch.py
 ```
 
-RCM state machine:
+选择内容：
 
-State `UNCONFIGURED` loads parameters only.
+- URDF 来自 `agx_arm_description` 安装路径。
+- planning group 选择六轴 arm。
+- end effector / tip frame 和 description 中一致。
+- joint limits 先保守设置。
+- controller 先用 fake execution。
 
-State `CALIBRATION_REQUIRED` waits for valid tool and RCM calibration.
+第 2 步：生成目录。
 
-State `READY` accepts commands with hardware disabled or mock backend.
+```text
+src/agx_arm_moveit_config/
+├── config/
+│   ├── agx_arm.srdf
+│   ├── kinematics.yaml
+│   ├── joint_limits.yaml
+│   ├── moveit_controllers.yaml
+│   └── planning_scene.yaml
+├── launch/
+│   ├── demo.launch.py
+│   ├── move_group.launch.py
+│   └── fake_execution.launch.py
+└── rviz/
+    └── moveit.rviz
+```
 
-State `ARMED` accepts commands with explicit deadman and live backend.
+第 3 步：只跑 fake plan。
 
-State `ACTIVE_RCM` solves and sends bounded joint targets.
+```bash
+colcon build --packages-select agx_arm_moveit_config --symlink-install
+source install/setup.bash
+ros2 launch agx_arm_moveit_config demo.launch.py
+```
 
-State `HOLD` holds the last safe target or stops motion.
+第 4 步：检查 planning scene。
 
-State `FAULT` rejects all commands until reset.
+- 工具 collision 是否显示。
+- 入口禁区是否可视化。
+- joint limits 是否与 URDF 和硬件资料一致。
+- fake execution 是否只在 RViz 中动，不接 hardware interface。
 
-State transitions must be logged.
+### 7.3 和 RCM controller 的关系
 
-State transitions must include reason codes.
+MoveIt 规划出的普通 TCP pose 不自动满足 RCM。推荐边界：
 
-State transitions must include timestamps.
+```text
+MoveIt: approach / retract / collision scene / visualization
+RCM controller: RCM_ACTIVE 内的局部约束和工具运动
+command owner: 真机写命令唯一出口
+```
 
-RCM acceptance:
+如果后续要做 RCM-aware planning，可以研究 C++ constraint sampler、MoveIt Servo 插件或自定义规划约束，但仍必须输出 `d_RCM`、状态机、reason code 和验收证据。不能因为 MoveIt plan 成功就跳过 RCM controller。
 
-The solver drives residual toward zero in simulation.
+### 7.4 验收标准
 
-The solver keeps insertion along the intended tool axis.
+- demo launch 能打开 RViz MotionPlanning。
+- fake plan 和 fake execution 可视化正常。
+- planning group、tip frame、joint limits 与 description 对齐。
+- Execute 不连接真实 hardware interface。
+- 文档中明确 MoveIt 不是 RCM 闭环本体。
 
-The solver rejects missing calibration.
+---
 
-The solver rejects stale `/rcm_cmd`.
+## 8. 功能包：`agx_arm_sim`
 
-The solver rejects mode mismatch.
+### 8.1 作用和边界
 
-The solver respects joint limits.
+`agx_arm_sim` 用于 MuJoCo、replay、模型同步和仿真观察。第一版建议只读：订阅 joint state 或 rosbag，把状态同步到 MuJoCo，不发布真实硬件命令。
 
-The solver respects velocity limits.
+它应该放：
 
-The solver has deterministic behavior in mock replay.
+| 内容 | 说明 |
+| --- | --- |
+| MuJoCo/MJCF 模型 | 从 URDF 和 joint map 派生 |
+| replay 节点 | 订阅 `/sim/joint_states` 或 rosbag |
+| joint map sim | ROS joint name 到 MuJoCo qpos index |
+| sim launch | 只在 `/sim` namespace 下运行 |
+| 差异记录 | 惯量、阻尼、关节限制和真实机械臂差异 |
 
-The solver error metric is logged.
+它不应该放：
 
-The solver supports replay from recorded intent messages.
+- SDK/CAN 写命令。
+- live command owner。
+- 默认 remap 到 `/live` 的控制 topic。
 
-solver 绝不直接写 `piper_sdk`；它只能通过批准的 command owner 输出。
+### 8.2 推荐目录
 
-## 14. MoveIt 与 RViz 计划流程（PLANNED）
+```text
+src/agx_arm_sim/
+├── package.xml
+├── CMakeLists.txt
+├── launch/
+│   ├── mujoco_replay.launch.py
+│   └── sim_view.launch.py
+├── config/
+│   ├── mujoco_replay.yaml
+│   └── joint_map_sim.yaml
+├── models/
+│   └── piper_rcm.xml
+└── src/
+    └── mujoco_replay_node.cpp
+```
 
-MoveIt is PLANNED.
+### 8.3 一步步搭建仿真只读链路
 
-MoveIt should not be treated as a safety layer.
+第 1 步：先加载模型。
 
-MoveIt can provide planning, visualization, and collision checking.
+确认 MJCF 或转换模型能打开，关节数量、方向、限制和 RViz 中一致。
 
-MoveIt configuration should be generated only after URDF frames are stable.
-
-MoveIt SRDF should include planning groups for the six arm joints.
-
-MoveIt should know the end effector frame.
-
-MoveIt should know the tool frame after calibration.
-
-MoveIt should not command hardware until ros2_control mock validation passes.
-
-MoveIt with `joint_trajectory_controller` should first run against mock hardware.
-
-MoveIt planned files:
-
-`src/agx_arm_moveit_config/config/piper.srdf`
-
-`src/agx_arm_moveit_config/config/kinematics.yaml`
-
-`src/agx_arm_moveit_config/config/joint_limits.yaml`
-
-`src/agx_arm_moveit_config/config/moveit_controllers.yaml`
-
-`src/agx_arm_moveit_config/launch/demo.launch.py`
-
-These files do not exist in CURRENT repository.
-
-PLANNED 示例：不要直接复制到 live arm。
+第 2 步：写 joint map。
 
 ```yaml
-moveit_simple_controller_manager:
-  controller_names:
-    - joint_trajectory_controller
-
-  joint_trajectory_controller:
-    type: FollowJointTrajectory
-    action_ns: follow_joint_trajectory
-    default: true
-    joints:
-      - joint1
-      - joint2
-      - joint3
-      - joint4
-      - joint5
-      - joint6
+mujoco_replay:
+  ros__parameters:
+    model_path: "REPLACE_WITH_MJCF"
+    joint_names: [joint1, joint2, joint3, joint4, joint5, joint6]
+    input_topic: /sim/joint_states
+    publish_control_topics: false
 ```
 
-MoveIt 验收标准：
+第 3 步：写 replay 节点。
 
-The planning scene loads without missing meshes.
+高频同步建议 C++，离线数据处理可以 Python。replay 节点只把输入 joint state 写入 MuJoCo qpos，不发布 live command。
 
-The six-joint planning group exists.
+第 4 步：使用 `/sim` namespace。
 
-The end effector frame is correct.
-
-The planned trajectory stays within joint limits.
-
-The controller interface is mock during first validation.
-
-The `joint_trajectory_controller` action is available.
-
-RViz displays the model, planned path, and current state.
-
-## 15. MuJoCo 与 Sim2Real 计划流程（PLANNED/RESEARCH）
-
-MuJoCo is PLANNED.
-
-MuJoCo can support simulation-first validation.
-
-MuJoCo must use an MJCF model whose joints match the ROS joint names or has an explicit mapping.
-
-MuJoCo must use consistent units.
-
-MuJoCo must include actuator limits.
-
-MuJoCo must include inertial parameters before dynamics claims.
-
-MuJoCo must include a tool model before RCM simulation claims.
-
-MuJoCo must publish or bridge joint states into ROS for replay.
-
-MuJoCo must consume bounded commands from the same high-level controller used in mock.
-
-Sim2Real must keep the same command contract across mock, simulation, HIL, and live.
-
-Sim2Real must record differences in timing, limits, friction, backlash, and latency.
-
-Planned files:
-
-`src/agx_arm_sim/mujoco/piper.xml`
-
-`src/agx_arm_sim/launch/mujoco_bridge.launch.py`
-
-`src/agx_arm_sim/config/sim2real.yaml`
-
-`src/agx_arm_sim/test/test_mujoco_replay.py`
-
-These files do not exist in CURRENT repository.
-
-PLANNED 示例：不要直接复制到 live arm。
-
-```mjcf
-<!-- MJCF snippet for planned simulation work only. -->
-<mujoco model="piper_rcm_mock">
-  <compiler angle="radian" coordinate="local" />
-  <option timestep="0.002" gravity="0 0 -9.81" />
-  <worldbody>
-    <body name="base_link" pos="0 0 0">
-      <body name="link1">
-        <joint name="joint1" type="hinge" axis="0 0 1" range="-2.6 2.6" />
-        <geom type="capsule" size="0.03 0.10" mass="1.0" />
-      </body>
-    </body>
-  </worldbody>
-  <actuator>
-    <position name="joint1_position" joint="joint1" kp="20" ctrlrange="-2.6 2.6" />
-  </actuator>
-</mujoco>
+```text
+/sim/joint_states
+/sim/rcm_status
+/sim/mujoco_state
 ```
 
-PLANNED 示例：不要直接复制到 live arm。
+禁止默认 remap 到 `/live/*`。
+
+第 5 步：记录仿真和真实差异。
+
+仿真成功只证明模型和接口映射可用，不证明真实机械臂安全。每次从仿真切到真机，都要重新检查 joint order、单位、timestamp、owner 和 stop action。
+
+### 8.4 验收标准
+
+- MuJoCo 能加载模型。
+- replay 时 joint1-joint6 方向与 RViz 一致。
+- 所有 sim topic 都在 `/sim` namespace 下。
+- 没有任何 `/live/*` command 输出。
+- 仿真差异记录可复查。
+
+---
+
+## 9. 功能包：`agx_arm_hw_interface`
+
+### 9.1 作用和边界
+
+`agx_arm_hw_interface` 是 Piper SDK/CAN 和 ROS 2 系统之间的硬件边界。第一版只做 read-only adapter；写控制 command owner 只能在 H0-H6 通过后开发。
+
+它应该放：
+
+| 内容 | 说明 |
+| --- | --- |
+| read-only adapter | 读取 SDK/CAN 状态，发布 joint state 和 diagnostics |
+| joint map | SDK index 到 `joint1`-`joint6` 的映射 |
+| unit conversion | 原始单位到 rad、rad/s、SI 单位 |
+| watchdog | command freshness、feedback freshness、stop action |
+| command owner | 后续唯一真实写命令出口 |
+| tests | unit conversion、joint map、watchdog、fail-closed |
+
+它不应该放：
+
+- rcm_teleop 输入解析。
+- RCM 数学和 solver。
+- MoveIt 规划逻辑。
+- MuJoCo 仿真控制。
+
+### 9.2 真机前安全准备
+
+真机上电前完成：
+
+1. 机械臂固定在稳定底座上。
+2. 工作空间内没有人、松散线缆、未固定工具或障碍物。
+3. 急停或断电方式可触达，操作者和观察员都知道如何使用。
+4. 末端工具和线缆不会被腕部旋转拉扯。
+5. 第一次上电只允许只读反馈。
+6. 禁止运行 SDK demo 的写控制示例。
+
+建议 evidence 目录：
+
+```text
+evidence/YYYYMMDD_HHMM_piper_readonly/
+├── 00_readme.md
+├── 01_photos/
+├── 02_versions/
+├── 03_can_logs/
+├── 04_sdk_readonly/
+├── 05_joint_map/
+└── 99_incidents/
+```
+
+evidence 可以放在外部受控存储，不一定提交进仓库。
+
+### 9.3 SocketCAN 只读流程
+
+安装工具：
+
+```bash
+sudo apt update
+sudo apt install -y can-utils iproute2 ethtool usbutils
+sudo modprobe can
+sudo modprobe can_raw
+sudo modprobe can_dev
+sudo modprobe gs_usb || true
+```
+
+识别设备：
+
+```bash
+lsusb
+dmesg | tail -n 80
+ip link show
+```
+
+配置 CAN：
+
+```bash
+sudo ip link set can0 down
+sudo ip link set can0 type can bitrate REPLACE_WITH_VENDOR_BITRATE
+sudo ip link set can0 up
+ip -details -statistics link show can0
+```
+
+只读抓包：
+
+```bash
+candump -L can0
+```
+
+通过条件：
+
+- CAN interface 能 up。
+- `candump` 有可解释帧或能明确证明无帧原因。
+- 错误计数不持续暴增。
+- 没有发送任何写控制帧。
+- 日志保存了 bitrate、adapter、时间、设备状态。
+
+### 9.4 SDK 只读流程
+
+当前仓库未集成 Piper SDK。SDK 检查应先作为只读外部 probe。
+
+记录安装：
+
+```bash
+pip3 show piper_sdk || true
+python3 -c "import piper_sdk; print(piper_sdk)"
+```
+
+只读 probe 通过条件：
+
+- SDK 能 import。
+- 能记录 SDK 版本或安装路径。
+- 能绑定 CAN interface。
+- 能读取状态，或明确返回只读失败并保存 traceback。
+- 失败时不发布默认零位、全零数组或上次状态。
+
+只读输出建议字段：SDK 版本、CAN interface、构造参数、读取函数名、原始返回结构、解析后 joint 数组、timestamp、错误码、异常栈。
+
+### 9.5 read-only adapter 一步步实现
+
+推荐 C++ 包结构：
+
+```text
+src/agx_arm_hw_interface/
+├── include/agx_arm_hw_interface/
+│   ├── piper_readonly_adapter.hpp
+│   ├── piper_command_owner.hpp
+│   ├── joint_map.hpp
+│   ├── unit_conversion.hpp
+│   └── watchdog.hpp
+├── src/
+│   ├── piper_readonly_adapter.cpp
+│   ├── piper_command_owner.cpp
+│   ├── joint_map.cpp
+│   ├── unit_conversion.cpp
+│   └── watchdog.cpp
+├── config/
+│   ├── piper_readonly.yaml
+│   └── piper_command_owner.yaml
+├── launch/
+│   ├── readonly_hardware.launch.py
+│   └── command_owner_low_energy.launch.py
+└── test/
+    ├── test_unit_conversion.cpp
+    ├── test_joint_map.cpp
+    └── test_watchdog.cpp
+```
+
+第 1 步：只实现读取，不暴露写函数。
+
+第 2 步：实现 joint map。
 
 ```yaml
-sim2real:
-  joint_name_map:
-    mujoco: [joint1, joint2, joint3, joint4, joint5, joint6]
-    ros: [joint1, joint2, joint3, joint4, joint5, joint6]
-  command_period_s: 0.01
-  state_timeout_s: 0.05
-  latency_budget_s: 0.02
-  backend_order:
-    - mock
-    - mujoco
-    - hil
-    - live
+piper_joint_map:
+  ros__parameters:
+    joint_names: [joint1, joint2, joint3, joint4, joint5, joint6]
+    sdk_indices: [0, 1, 2, 3, 4, 5]
+    position_unit: rad
+    velocity_unit: rad_s
+    direction_sign: [1, 1, 1, 1, 1, 1]
 ```
 
-MuJoCo 验收标准：
+第 3 步：实现 unit conversion。
 
-The model loads without warnings.
+所有输出给 ROS 的角度、速度和时间都必须统一单位。单位不明时，adapter 应发布 diagnostics error，而不是猜。
 
-Joint names match mapping.
+第 4 步：发布 `joint_states` 和 diagnostics。
 
-Joint limits match ROS config.
+失败处理：
 
-Actuator limits are conservative.
+- 长度不为 6：不发布假 `joint_states`。
+- NaN/Inf：进入 error diagnostics。
+- timestamp 过期：标记 feedback stale。
+- SDK/CAN error：fail-closed。
 
-The bridge publishes `/joint_states` at the expected rate.
+第 5 步：写测试。
 
-The bridge receives commands through the same planned controller interface.
+- joint order 对表测试。
+- 单位转换测试。
+- error code 转 diagnostics 测试。
+- timeout/watchdog 测试。
 
-Replay tests produce deterministic results.
+### 9.6 command owner 何时实现
 
-RCM residual can be measured in simulation.
+command owner 只能在以下条件满足后实现：
 
-## 16. H0-H9 硬件门控（PLANNED）
+- CAN 只读稳定。
+- SDK 只读稳定。
+- joint map 冻结。
+- RCM controller mock/sim 验证通过。
+- H0-H6 门控通过。
+- 有观察员和急停方案。
 
-H0 is documentation and scope gate.
+command owner 必须具备：
 
-H1 is unboxing and mechanical inspection gate.
+- lifecycle 状态。
+- explicit operator enable。
+- command timestamp 和 `valid_for_sec` 检查。
+- watchdog heartbeat。
+- joint limit 和速度限制。
+- stop/hold/fault action。
+- single owner 检查。
+- SDK/CAN error fail-closed。
 
-H2 is emergency-stop and power safety gate.
+写控制禁止直接接收 rcm_teleop 原始 axes；它只接收 controller/safety 授权后的命令。
 
-H3 is PC, OS, ROS, and dependency gate.
+---
 
-H4 is SocketCAN read-only gate.
+## 10. 功能包：`agx_arm_bringup`
 
-H5 is vendor SDK read-only gate.
+### 10.1 作用和边界
 
-H6 is mock and simulation control gate.
+`agx_arm_bringup` 只负责组合 launch、参数、namespace 和安全默认值。它不写算法，不接 SDK 细节，不重新实现 RCM 公式。
 
-H7 is HIL low-energy command gate.
+bringup 的目标是让每个阶段有单独、可复现、默认安全的启动入口。
 
-H8 is supervised live position command gate.
+### 10.2 推荐目录
 
-H9 is extended scenario validation gate.
+```text
+src/agx_arm_bringup/
+├── package.xml
+├── CMakeLists.txt
+├── launch/
+│   ├── display.launch.py
+│   ├── joystick_dry_run.launch.py
+│   ├── mock_rcm.launch.py
+│   ├── sim_replay.launch.py
+│   ├── readonly_hardware.launch.py
+│   └── live_low_energy.launch.py
+└── config/
+    ├── common_frames.yaml
+    ├── safety_limits.yaml
+    ├── namespaces.yaml
+    └── tool_manifest.yaml
+```
 
-H0-H6 must pass before any write-control experiment.
+### 10.3 一步步写 launch
 
-H0-H6 must pass before MIT mode.
+第 1 步：`display.launch.py`。
 
-H0-H6 must pass before torque control.
+启动 description、robot_state_publisher、joint_state_publisher_gui、RViz。禁止启动 controller 和 hardware。
 
-H0-H6 must pass before impedance control.
+第 2 步：`joystick_dry_run.launch.py`。
 
-H0-H6 must pass before current control.
+启动 `joy_node` 和 `rcm_teleop` dry-run。只观察 topic，不接 command owner。
 
-H0-H6 must pass before gain-level tuning.
+第 3 步：`mock_rcm.launch.py`。
 
-H0-H6 must pass before low-level motor-control.
+启动 mock joint state、RCM controller、status 输出。默认 `hardware_write_enabled:=false`。
 
-H0-H6 must pass before vendor examples that move the arm.
+第 4 步：`sim_replay.launch.py`。
 
-H0-H6 must pass before `cansend`.
+启动 `/sim` namespace 下的 replay/MuJoCo。禁止 remap 到 `/live`。
 
-H0-H6 must pass before `piper_sdk` write commands.
+第 5 步：`readonly_hardware.launch.py`。
 
-H0 acceptance:
+启动 CAN/SDK read-only adapter 和 diagnostics。禁止启动 command owner。
 
-The team can state CURRENT, PLANNED, and RESEARCH boundaries.
+第 6 步：`live_low_energy.launch.py`。
 
-The team can state what the repository can and cannot do.
+只有 H0-H6 通过后才写。必须显式传入：
 
-The team can state the command owner plan.
+```text
+hardware_write_enabled:=true
+evidence_dir:=...
+tool_manifest:=...
+operator_enable_required:=true
+speed_scale_limit:=...
+```
 
-H1 acceptance:
+没有这些参数时，launch 应失败或保持只读。
 
-The arm has no visible shipping damage.
+### 10.4 launch 默认值
 
-The serial number is recorded.
+推荐所有 launch 参数默认安全：
 
-The workspace is defined.
+```text
+hardware_write_enabled:=false
+use_sim_time:=false
+namespace:=/mock 或 /sim
+allow_sdk_write:=false
+require_deadman:=true
+require_watchdog:=true
+```
 
-H2 acceptance:
+live launch 不能和 fake/sim controller 同时抢 command owner。一个 launch 文件头部应写清楚：本 launch 属于哪个阶段、是否允许写硬件、启动后要观察哪些 topic、失败时怎么停。
 
-Emergency stop is reachable and tested according to vendor guidance.
+### 10.5 验收标准
 
-Power supply is verified.
+- 每个 launch 能单独说明阶段和风险。
+- 默认不会写硬件。
+- `/sim`、`/mock`、`/live` namespace 不混淆。
+- live launch 必须显式参数开启写控制。
+- bringup 中没有 RCM 公式、SDK 细节或 rcm_teleop 解析逻辑。
 
-The arm is mounted or restrained safely.
+---
 
-H3 acceptance:
+## 11. 从 mock 到真机的逐步验收
 
-Ubuntu version is recorded.
+本章是操作检查清单，不是抽象计划。每一步都必须有输入条件、执行命令、通过标准和停止条件。
 
-ROS 2 version is recorded.
+### 11.1 H0：仓库和环境基线
 
-Build dependencies are recorded.
+输入条件：不接真机。
 
-The workspace builds.
+执行：
 
-The joystick launch runs dry.
+```bash
+source /opt/ros/humble/setup.bash
+colcon build --symlink-install
+colcon test --event-handlers console_direct+
+colcon test-result --verbose
+```
 
-H4 acceptance:
+通过：当前已有包能构建，已有测试能跑，失败项可解释。
 
-CAN adapter is detected.
+停止：构建失败、依赖缺失、package manifest 不一致。
 
-SocketCAN interface is configured.
+### 11.2 H1：模型显示
 
-`candump` read-only output is captured.
+输入条件：`agx_arm_description` 资源安装完成。
 
-No CAN writes occurred.
+执行：
 
-H5 acceptance:
+```bash
+ros2 launch agx_arm_description display_piper.launch.py
+```
 
-Vendor SDK version is pinned.
+通过：RViz 显示模型，TF tree 连续，joint direction 可解释。
 
-`piper_sdk` read-only connection behavior is documented.
+停止：mesh 缺失、URDF 解析失败、joint/frame 命名和文档不一致。
 
-Firmware version is captured if read-only access exists.
+### 11.3 H2：输入 dry-run
 
-No motion command occurred.
+输入条件：不接硬件写口。
 
-H6 acceptance:
+执行：
 
-Mock backend tests pass.
+```bash
+ros2 launch rcm_teleop rcm_teleop.launch.py
+ros2 topic echo /rcm_mode
+ros2 topic echo /rcm_cmd
+```
 
-Simulation tests pass if simulation exists.
+通过：手柄输入稳定，deadzone 和 mode 可复查。
 
-Controller rejects stale commands.
+停止：输入漂移、按钮映射不明、断开手柄后仍持续输出有效 intent。
 
-Controller rejects missing calibration.
+### 11.4 H3：RCM 数学单元测试
 
-Controller rejects invalid mode.
+输入条件：`agx_arm_controller` C++ 数学库完成。
 
-H7 acceptance:
+执行：
 
-HIL fixture is physically constrained.
+```bash
+colcon test --packages-select agx_arm_controller --event-handlers console_direct+
+colcon test-result --verbose
+```
 
-Command limits are reduced.
+通过：残差、雅可比、solver、状态机测试都通过。
 
-Observer owns emergency stop.
+停止：有限差分不一致、solver failure 无 reason code、状态机 failure path 未覆盖。
 
-Logs prove low-energy behavior.
+### 11.5 H4：mock RCM controller
 
-H8 acceptance:
+输入条件：typed command 和 mock feedback 可用。
 
-Position command path is supervised.
+执行：
 
-Command owner is unique.
+```bash
+ros2 launch agx_arm_bringup mock_rcm.launch.py
+ros2 topic echo /rcm_status
+```
 
-Joint limits are enforced.
+通过：不接硬件也能看到 `d_RCM`、solver status、reason code、task scale。
 
-Velocity limits are enforced.
+停止：status 缺字段、command 过期仍 active、feedback 过期仍输出 candidate command。
 
-Emergency stop behavior is verified.
+### 11.6 H5：仿真和 replay
 
-H9 acceptance:
+输入条件：`/sim` namespace 隔离完成。
 
-RCM scenarios pass with residual threshold.
+执行：
 
-Repeated sessions pass.
+```bash
+ros2 launch agx_arm_bringup sim_replay.launch.py
+ros2 topic list | grep /sim
+```
 
-Calibration reload passes.
+通过：MuJoCo/replay 只读同步，无 `/live/*` command 输出。
 
-Fault injection passes.
+停止：仿真 topic remap 到 live、joint order 不一致、仿真成功被当作真机安全证据。
 
-Recovery procedure passes.
+### 11.7 H6：CAN/SDK 只读
 
-## 17. 依赖矩阵（x86_64 / ARM64）
+输入条件：现场安全准备完成，禁止写控制。
 
-目标 x86_64 平台是 Ubuntu 22.04 + ROS 2 Humble。
+执行：
 
-目标 ARM64 平台默认是 Ubuntu 22.04 + ROS 2 Humble，除非硬件要求其他版本。
+```bash
+ip -details -statistics link show can0
+candump -L can0
+```
 
-核心构建工具是 CMake、colcon、Python 3 和 ament。
+再运行 SDK 只读 probe 或 read-only adapter。
 
-Core ROS dependencies are `rclpy`, `sensor_msgs`, `std_msgs`, `geometry_msgs`, `launch`, and `launch_ros` for current joystick work.
+通过：反馈可读，joint map 初步可解释，error code 可记录。
 
-Planned control dependencies include `hardware_interface`, `controller_interface`, `controller_manager`, `joint_state_broadcaster`, and `joint_trajectory_controller`.
+停止：CAN error 暴增、SDK 读取失败且不可复盘、joint order/单位不明。
 
-Planned kinematics dependencies may include KDL, Pinocchio, Eigen, or MoveIt.
+### 11.8 H7：read-only adapter 接入 ROS
 
-Planned perception dependencies may include OpenCV and PCL only when perception scope exists.
+输入条件：CAN/SDK 只读稳定。
 
-Eigen is expected to be architecture-independent through apt or source.
+执行：
 
-OpenCV package names and ABI must be recorded for ARM64.
+```bash
+ros2 launch agx_arm_bringup readonly_hardware.launch.py
+ros2 topic echo /joint_states
+ros2 topic echo /diagnostics
+```
 
-PCL package names and ABI must be recorded for ARM64.
+通过：真实反馈进入 ROS，diagnostics 能显示 SDK/CAN 状态，invalid feedback 不发布假数据。
 
-Pinocchio installation route must be recorded for both architectures.
+停止：反馈过期仍正常发布、单位不明、diagnostics 吞错。
 
-MuJoCo availability must be checked separately on ARM64.
+### 11.9 H8：低能量单关节真机
 
-部署前必须验证 vendor SDK 的 ARM64 支持。
+输入条件：H0-H7 通过，command owner 完成并 review，现场有观察员和急停方案。
 
-CAN adapter kernel driver 必须在 x86_64 和 ARM64 两个平台分别验证。
+执行原则：
 
-Do not assume x86_64 USB-CAN behavior matches ARM64 behavior.
+- 单关节。
+- 小步长。
+- 低速度。
+- 短时。
+- 每次只改变一个变量。
+- 记录 command、feedback、diagnostics、视频或照片。
 
-Do not assume Python wheels are available on ARM64.
+通过：命令和反馈方向一致，stop action 可用，watchdog 可实测。
 
-Do not assume MuJoCo GPU behavior is available on ARM64.
+停止：方向不一致、停止延迟不可接受、SDK/CAN error、机械臂异常声音/振动/线缆拉扯。
 
-## 18. 构建与测试目标（CURRENT/PLANNED）
+### 11.10 H8.5：低能量重力补偿真机
 
-CURRENT 构建目标是构建 workspace 并运行现有 package tests。
+输入条件：H8 通过，`GravityCompensator` 单元测试、mock/sim/replay 验证通过，工具载荷和重力方向已记录，command owner 已确认硬件接口支持对应输出模式。
 
-CURRENT 手柄目标是 dry-run topic validation。
+执行原则：
 
-CURRENT description 目标是静态 URDF inspection。
+- 先不装工具或使用最小已知载荷。
+- 先单关节，再多关节。
+- 先短时使能，再逐步延长观察时间。
+- 每次只改变一个姿态或一个载荷参数。
+- 全程记录 `tau_g_nm`、`tau_limited_nm`、joint feedback、diagnostics、SDK/CAN mode 和现场视频。
 
-PLANNED 构建目标是添加 mock-first ros2_control integration。
+通过：使能重力补偿后机械臂没有突跳、漂移、异常振动或持续增大的跟随误差；松开 enable 或触发 stop 后立即退出到 `HOLD` 或 `FAULT`；日志能复盘每个力矩限幅和 reason code。
 
-PLANNED 测试目标是在硬件前验证 command interface。
+停止：关节反向、力矩突变、SDK/CAN 报错、模式不支持、工具载荷不确定、机械臂下坠/上冲、操作者无法稳定停止。
 
-PLANNED launch objective is to support mock, simulation, HIL, and live profiles with explicit parameters.
+### 11.11 H9：低能量 RCM 真机
 
-RESEARCH 目标是在没有 live actuation 的情况下评估 torque、impedance、gravity compensation 和 RCM algorithm。
+输入条件：H8 通过，RCM tool manifest 和 pivot calibration 冻结。如果 RCM 真机阶段启用重力补偿，则 H8.5 也必须通过。
 
-最小构建命令：
+执行原则：
+
+- 只做小范围 pivot。
+- 再做小范围 insertion。
+- 最后做低速 roll。
+- 全程记录 `d_RCM` 和 reason code。
+- RCM 残差超阈值立即 hold/fault。
+
+通过：低速 RCM 任务中 `d_RCM` 在阈值内，状态机退出条件可触发，stop action 可复查。
+
+停止：残差增长、插入时入口横向偏移、solver failure 后仍输出命令、日志不足以复盘。
+
+---
+
+## 12. 故障处理、接口契约和文档维护
+
+### 12.1 常见故障处理
+
+| 现象 | 优先检查 | 正确处理 |
+| --- | --- | --- |
+| URDF 显示缺 mesh | install 规则、`package://` 路径、文件大小写 | 回到 description 修路径，不在 RViz 临时加载本地文件 |
+| 手柄静止仍漂移 | deadzone、手柄校准、axes 编号 | 增大 deadzone，记录手柄型号和映射 |
+| RCM 残差符号反了 | tool axis、frame、joint direction、雅可比有限差分 | 回到 description/tool manifest，不在 solver 硬翻符号 |
+| solver 输出速度过大 | singular、condition number、lambda、速度限制 | task scale 或 hold，不逐关节硬裁剪后继续 |
+| CAN error 暴增 | bitrate、终端电阻、供电、接地、线缆 | 停止真机测试，只保留只读排查 |
+| SDK 读取失败 | SDK 版本、CAN interface、权限、firmware | 保存 traceback，不发布假反馈 |
+| live launch 意外启动写口 | launch 默认值、hardware_write_enabled、command owner | 立即停止，修 bringup 默认安全值 |
+| MoveIt plan 成功但 RCM 偏了 | MoveIt 不保证 RCM、tool frame、RCM controller 未接管 | 不执行真机，回到 controller/mock 验证 |
+
+### 12.2 接口契约必须写清楚
+
+每个跨包 topic/service/action 都应记录：
+
+```text
+名称：/rcm_command
+类型：rcm_msgs/msg/RCMCommand
+发布者：rcm_teleop 或上层 intent adapter
+订阅者：agx_arm_controller
+frame：base_link
+单位：m、rad、m/s、rad/s
+频率：按输入源，controller 检查 valid_for_sec
+超时：command_timeout_sec
+失败语义：过期后 controller HOLD，不沿用旧命令
+```
+
+硬件相关接口还必须记录：
+
+- joint order。
+- 单位。
+- timestamp 来源。
+- SDK/CAN error 映射。
+- stop action。
+- owner 状态。
+
+### 12.3 reason code 建议
+
+固定 reason code 有利于日志检索和自动测试。建议使用类似：
+
+| reason code | 含义 |
+| --- | --- |
+| `OK` | 正常 |
+| `COMMAND_STALE` | 命令过期 |
+| `FEEDBACK_STALE` | 反馈过期 |
+| `TF_MISSING` | TF 缺失或时间不一致 |
+| `TOOL_MISMATCH` | tool_id 不匹配 |
+| `CALIBRATION_MISMATCH` | 标定版本不匹配 |
+| `RCM_ERROR_HIGH` | RCM 残差超限 |
+| `SOLVER_INFEASIBLE` | 求解不可行 |
+| `SINGULARITY_NEAR` | 接近奇异 |
+| `JOINT_LIMIT_NEAR` | 接近或预测越过限位 |
+| `WATCHDOG_TIMEOUT` | watchdog 超时 |
+| `SDK_ERROR` | SDK 返回错误 |
+| `CAN_ERROR` | CAN 通信错误 |
+| `OWNER_CONFLICT` | command owner 冲突 |
+| `OPERATOR_RELEASED` | 操作者释放 deadman/enable |
+
+### 12.4 记录模板
+
+RCM 标定记录：
+
+```text
+date:
+operator:
+tool_id:
+calibration_version:
+base_frame:
+flange_frame:
+axis_point_flange_m:
+axis_direction_flange:
+lambda_min_m:
+lambda_max_m:
+fit_rms_m:
+source_bag/log:
+review_result:
+```
+
+H gate 记录：
+
+```text
+gate: H0/H1/...
+date:
+operator:
+observer:
+command:
+expected_result:
+actual_result:
+logs:
+incidents:
+pass/fail:
+next_allowed_step:
+```
+
+incident 记录：
+
+```text
+time:
+stage:
+symptom:
+last_command:
+feedback_state:
+diagnostics:
+stop_action:
+root_cause:
+fix:
+retest_required:
+```
+
+### 12.5 文档维护规则
+
+- 修改 topic、message、frame、单位、timeout、reason code 后，必须同步本文。
+- 修改 joint order、tool axis、tool manifest、calibration version 后，必须同步本文和 evidence。
+- 新增 live launch 前，必须写清默认是否写硬件、需要哪些 H gate。
+- 从 `PLANNED` 改成 `CURRENT` 前，必须补路径、命令和验收结果。
+- 不把外部项目映射写进本项目文档；本手册只描述当前项目。
+
+---
+
+## 附录 A：命令速查
+
+构建全部：
 
 ```bash
 source /opt/ros/humble/setup.bash
 colcon build --symlink-install
 source install/setup.bash
-colcon test --event-handlers console_direct+
+```
+
+构建单包：
+
+```bash
+colcon build --packages-select rcm_teleop --symlink-install
+```
+
+运行当前 rcm_teleop dry-run：
+
+```bash
+ros2 launch rcm_teleop rcm_teleop.launch.py
+ros2 topic echo /joy
+ros2 topic echo /rcm_mode
+ros2 topic echo /rcm_cmd
+```
+
+检查接口：
+
+```bash
+ros2 interface list | grep rcm_msgs
+ros2 interface show rcm_msgs/msg/RCMCommand
+```
+
+重力补偿开发阶段检查：
+
+```bash
+# PLANNED：等 agx_arm_controller 测试落地后执行。
+colcon test --packages-select agx_arm_controller --event-handlers console_direct+
 colcon test-result --verbose
 ```
 
-最小 launch 命令：
+检查 package：
 
 ```bash
-source install/setup.bash
-ros2 launch joystick joystick.launch.py
+ros2 pkg list | grep agx
+ros2 pkg prefix agx_arm_description
+ros2 pkg executables rcm_teleop
 ```
 
-最小 topic 验证命令：
+CAN 只读：
 
 ```bash
-ros2 topic list
-ros2 topic hz /joy
-ros2 topic hz /rcm_cmd
-ros2 topic echo /rcm_mode --once
-```
-
-最小 CAN 只读命令：
-
-```bash
-ip link show
-ip -details link show can0
+ip -details -statistics link show can0
 candump -L can0
 ```
 
-## 19. 故障排查表
+文档结构检查：
 
-| Symptom | Likely Cause | Diagnostic Command | Action |
+```bash
+awk '/^````/ {in4=!in4; next} /^```/ && !in4 {in3=!in3; next} !in3 && !in4 && /^##[#]? / {print FNR ":" $0}' docs/PIPER_RCM_DEVELOPMENT_GUIDE.md
+git diff --check -- docs/PIPER_RCM_DEVELOPMENT_GUIDE.md
+```
+
+---
+
+## 附录 B：功能包状态表
+
+| 功能包 | 当前状态 | 下一步 | 是否允许写硬件 |
 | --- | --- | --- | --- |
-| `colcon build` cannot find ROS packages | ROS environment not sourced | `printenv ROS_DISTRO` | Source `/opt/ros/humble/setup.bash` |
-| `ros2 launch joystick joystick.launch.py` fails | Workspace overlay not sourced | `ros2 pkg list | rg joystick` | Source `install/setup.bash` |
-| `/joy` is missing | Gamepad or `joy_node` not running | `ros2 topic list` | Check USB gamepad and launch output |
-| `/rcm_cmd` is missing | Custom node not running | `ros2 node list` | Check Python executable install |
-| `/rcm_mode` never changes | Button map mismatch | `ros2 topic echo /joy` | Record button indices and update planned mapping |
-| `/rcm_cmd` changes outside expectation | Mode or axis map confusion | `ros2 topic echo /rcm_mode` | Confirm mode is `RCM_CONTROL` |
-| `ros2 param get` fails | Node name differs | `ros2 node list` | Try `/gamepad_controller` or `/rcm_gamepad_controller` |
-| CAN interface missing | Adapter not detected | `lsusb` | Check adapter, cable, driver |
-| `ip link set can0 up` fails | Wrong bitrate or driver issue | `dmesg --ctime` | Confirm vendor bitrate and kernel driver |
-| `candump` shows no frames | Robot silent or bus issue | `ip -details link show can0` | Stay read-only and inspect wiring |
-| RViz mesh missing | Package mesh path mismatch | `ros2 run xacro xacro --inorder MODEL` | Fix package paths in planned URDF work |
-| MoveIt cannot plan | Config not implemented | `ros2 pkg list | rg moveit` | Build planned MoveIt package first |
-| MuJoCo model fails load | MJCF not implemented | `python3 -c 'import mujoco'` | Build planned simulation package first |
-| Controller does not activate | Hardware interface missing | `ros2 control list_hardware_interfaces` | Implement mock ros2_control first |
-| Gravity compensation unstable | Model or torque sign invalid | Replay known poses | Return to mock and simulation |
-| RCM residual grows | Jacobian sign or frame mismatch | Log residual and TF | Re-check tool calibration and frames |
-| Live motion unexpected | Command owner or safety fault | Emergency stop | Stop, preserve logs, review H gates |
-
-## 20. 资料链接与参考来源
-
-Use official ROS 2 Humble documentation for launch, parameters, and colcon basics.
-
-Use official ros2_control documentation for `SystemInterface`, controllers, and lifecycle behavior.
-
-Use official MoveIt 2 documentation for configuration generation and planning scene behavior.
-
-Use official MuJoCo documentation for MJCF modeling and actuator definitions.
-
-Use Linux kernel and can-utils documentation for SocketCAN behavior.
-
-Use vendor Piper documentation for CAN bitrate, frame IDs, SDK use, firmware compatibility, and emergency stop behavior.
-
-Use `piper_sdk` only from a pinned vendor-approved source.
-
-Use Pinocchio documentation for rigid-body dynamics and `rnea` usage.
-
-Use Orocos KDL documentation for kinematics and dynamics alternatives.
-
-Record every external link with access date in the evidence package.
-
-Do not treat tutorial snippets as vendor safety approval.
-
-Do not treat community examples as live-control validation.
-
-Do not use third-party Piper adapters on a live arm without source audit and HIL validation.
-
-参考资料检查清单：
-
-- ROS 2 Humble installation and tutorials.
-- colcon documentation.
-- ros2_control documentation.
-- joint_trajectory_controller documentation.
-- MoveIt 2 documentation.
-- MuJoCo documentation.
-- SocketCAN and can-utils documentation.
-- Piper vendor manual.
-- Piper SDK or `piper_sdk` source documentation.
-- Pinocchio documentation.
-- Orocos KDL documentation.
-
-## 21. 实用开发顺序
-
-从 CURRENT dry-run 工作开始。
-
-构建 workspace。
-
-启动 joystick。
-
-检查 `/joy`。
-
-检查 `/rcm_mode`。
-
-检查 `/rcm_cmd`。
-
-记录真实 gamepad mapping。
-
-检查 URDF frames。
-
-Add RViz model launch as PLANNED source work.
-
-Add calibration YAML loader as PLANNED source work.
-
-Add typed RCM command message as PLANNED source work.
-
-Add mock ros2_control hardware as PLANNED source work.
-
-Add controller manager launch as PLANNED source work.
-
-Add `joint_trajectory_controller` mock validation.
-
-Add RCM solver unit tests.
-
-Add RCM replay tests.
-
-Add MuJoCo model after URDF and inertials are settled.
-
-Add MoveIt config after frames and joint limits are settled.
-
-Add SocketCAN read-only evidence after hardware arrives.
-
-Add vendor SDK read-only evidence after SocketCAN is stable.
-
-Add HIL only after mock and simulation pass.
-
-Add live position control only after H7 passes.
-
-Keep gravity compensation in RESEARCH until model and safety evidence pass.
-
-Keep MIT mode in RESEARCH until vendor semantics, limits, and HIL evidence pass.
-
-Keep torque control in RESEARCH until vendor semantics, limits, and HIL evidence pass.
-
-Keep impedance control in RESEARCH until vendor semantics, limits, and HIL evidence pass.
-
-Keep current control in RESEARCH until vendor semantics, limits, and HIL evidence pass.
-
-Keep gain-level tuning in RESEARCH until vendor semantics, limits, and HIL evidence pass.
-
-Keep low-level motor-control in RESEARCH until vendor semantics, limits, and HIL evidence pass.
-
-## 22. 本指南完成定义
-
-The guide names CURRENT repository behavior.
-
-The guide names PLANNED implementation work.
-
-The guide names RESEARCH-only control concepts.
-
-The guide includes complete hardware arrival SOP.
-
-The guide includes Ubuntu, ROS 2, CAN, and SocketCAN setup.
-
-The guide includes read-only `candump` validation.
-
-The guide includes current colcon and joystick commands.
-
-The guide includes current joystick interface details.
-
-The guide includes 设零, 回零, and 校零 distinctions.
-
-The guide includes YAML and Python examples for calibration planning.
-
-The guide includes URDF/xacro and RViz planned examples.
-
-The guide includes ros2_control C++, YAML, and launch planned examples.
-
-The guide includes secondary development Python and C++ skeletons.
-
-The guide includes gravity compensation principles and skeletons.
-
-The guide includes RCM formulas, DLS/QP discussion, solver skeleton, state machine, and acceptance.
-
-The guide includes MoveIt planned files and flow.
-
-The guide includes MuJoCo planned files, flow, and MJCF snippet.
-
-The guide includes H0-H9 gates.
-
-The guide keeps MIT, torque, impedance, current, gain-level, and low-level motor-control disabled through H0-H6.
-
-The guide includes troubleshooting and reference sources.
-
-The guide does not claim unavailable source code exists.
-
-The guide does not authorize live control.
-
-The guide should be updated when actual source packages implement PLANNED items.
-
-## 最终补充：当前仓库、二次开发、低层电机禁用、故障排查与资料链接核对
-
-本节用于把操作手册中的关键边界再次集中说明，避免读者只阅读单个代码块后误操作实机。
-
-### 当前仓库能做什么
-
-`CURRENT`：当前仓库可以作为 ROS 2 workspace 构建，可以查看 Piper URDF/mesh 资源，可以运行 `joystick` 包的 `gamepad_controller` 节点，并通过 `/joy` 生成 `/rcm_mode` 与 `/rcm_cmd` 的上层意图消息。当前仓库没有实机 Piper 硬件驱动、没有 validated `piper_sdk` 写控制、没有 ros2_control hardware interface、没有 MoveIt 执行链、没有 MuJoCo bridge、没有重力补偿实机控制器、没有闭环 RCM controller。
-
-### 二次开发边界
-
-`PLANNED`：二次开发应先在 mock、仿真、HIL、只读 CAN 证据链上完成接口收敛，再进入低速实机。任何新增节点、controller、SDK adapter、MoveIt bridge、MuJoCo bridge、重力补偿模块或 RCM solver 都必须保留 CURRENT/PLANNED/RESEARCH 标注，不能把示例代码直接当成 live arm 指令。
-
-### RCM 工具轴有效段与不规则工具限制
-
-`PLANNED`：本文的 RCM 模型只适用于已标定的刚性工具功能轴，并且 RCM 点必须落在有效直杆工具轴段的允许范围内。有效直杆段需要在工具 manifest 中记录 `lambda_min`、`lambda_max`、标定数据来源、拟合残差和版本号。RCM 点不能只落在数学上的无限延长线；如果 RCM 点在无限延长线但不在真实可通过的有效直杆段内，必须判定为不合格。
-
-远心点偏差指标定义为残差范数 `||e||`，其中 `e` 是 RCM 点到工具功能轴的垂直残差。阈值必须由项目风险评审和实测冻结；持续超限、残差增长趋势、DLS/QP solver 不可行、雅可比奇异、约束冲突或残差不下降时，控制状态必须进入 `HOLD` 或 `FAULT`，停止发送新目标，并记录 reason code、关节状态、输入命令、solver 状态和时间戳。
-
-弯曲工具、柔性工具、非刚性工具、多段工具、非轴对称工具、偏心夹具或复杂末端几何，不得仅用单一直线轴 RCM 模型声明合格。除非另行建立几何/柔性/接触模型并通过 mock、仿真、HIL 和低能量 live 门控验证，否则这些工具只能标为 `RESEARCH`。
-
-软件 RCM 不是硬件安全屏障，不能替代机械限位、物理急停、夹具约束、监督员、低速单关节验证、watchdog 和低能量 HIL/live 门控。软件 RCM 只是一层控制目标或约束，任何证据缺失都必须 fail closed。
-
-### 低层电机禁用与 H0-H6 门控
-
-`RESEARCH`：MIT、torque、impedance、current、gain-level、low-level motor-control 等低层电机禁用策略在 H0-H6 完成前一律生效。H0-H6 证据完成前，禁止把 `piper_sdk`、`piper_ros`、community adapter 或 MIT-mode script 的示例命令复制到 live arm 上运行。
-
-在任何多关节 HIL/live 运动前，必须先完成“低速单关节 only”门控：一次只允许一个关节动作；最大速度、最大步长、最大持续时间和停止距离由项目风险评审冻结；观察员和 e-stop 所有人必须明确；日志必须记录目标关节、方向、速度、步长、反馈、停止方式和异常码。
-
-watchdog 必须有明确 heartbeat source、timeout threshold、stop/fail-closed action、recovery condition 和 evidence logs。控制节点卡死、SDK 阻塞、topic 静默、CAN 异常或 command timestamp 过期时，必须停止发送新目标，并进入 `HOLD` 或 `FAULT`。
-
-joint-order 核对必须覆盖 URDF、ROS controller、vendor SDK/API、CAN protocol、MuJoCo 和 MoveIt。只有 joint name、index、方向、单位、限位和零位定义全部一致后，才能进入 command enable。
-
-firmware/SDK/API 版本兼容证据必须记录 robot serial、firmware version、SDK commit/tag、API method semantics、CAN bitrate、joint order、unit scaling 和测试日期。只记录 firmware/SDK 不够；API 行为变化同样可能导致错误运动。
-
-### 故障排查与资料链接核对
-
-故障排查必须优先按 fail-closed 处理：看不到 `/joy` 就不测试上层意图；看不到 `/rcm_cmd` 就不接控制器；看不到 CAN 只读反馈就不发任何 SDK 写命令；joint-order 未核对就不允许 command enable；watchdog 未实测就不允许持续运动；RCM 残差无法下降就进入 `HOLD` 或 `FAULT`。
-
-资料链接应优先使用官方或一手资料：AgileX/Piper SDK、ROS 2 Humble、URDF、tf2、robot_state_publisher、ros2_control、joint_trajectory_controller、MoveIt 2、MoveIt Servo、MuJoCo、SocketCAN、Pinocchio 和 KDL。第三方文章只能作为辅助理解，不能作为 live arm 安全依据。
-
-PLANNED 示例：不要直接复制到 live arm。
-
-```launch.py
-from launch import LaunchDescription
-from launch_ros.actions import Node
-
-
-def generate_launch_description():
-    return LaunchDescription([
-        Node(
-            package="robot_state_publisher",
-            executable="robot_state_publisher",
-            parameters=[{"robot_description": "<planned xacro output>"}],
-        ),
-        Node(
-            package="joint_state_publisher_gui",
-            executable="joint_state_publisher_gui",
-        ),
-        Node(
-            package="rviz2",
-            executable="rviz2",
-            arguments=["-d", "config/piper_view.rviz"],
-        ),
-    ])
-```
-
-PLANNED 示例：不要直接复制到 live arm。
-
-```mjcf
-<mujoco model="piper_planned">
-  <option timestep="0.002" gravity="0 0 -9.81"/>
-  <worldbody>
-    <body name="base_link">
-      <body name="link1">
-        <joint name="joint1" type="hinge" axis="0 0 1" limited="true" range="-2.6 2.6"/>
-      </body>
-    </body>
-  </worldbody>
-  <actuator>
-    <position name="joint1_position" joint="joint1" kp="20"/>
-  </actuator>
-</mujoco>
-```
-
-## 如何使用这份文档（中文索引）
-
-新手阅读顺序：先看“中文阅读入口 / 中文版本说明 / 松灵 SDK 使用总览”、第 0 章“范围与安全契约”、第 1 章“当前仓库地图（CURRENT）”、第 2 章“当前可安全运行的命令（CURRENT）”和第 3 章“CURRENT / PLANNED / RESEARCH 标签含义”。这些章节只说明当前仓库能做什么、不能做什么，以及哪些命令属于 dry run。
-
-SDK 与 CAN 阅读顺序：先看第 5 章“PC、Ubuntu、ROS 2、CAN 与 SocketCAN SOP（PLANNED）”、第 6 章“松灵 / AgileX Piper SDK 使用手册（PLANNED/RESEARCH）”，再看下面的“松灵 / AgileX Piper SDK 详细使用补充（中文）”。这些内容只用于安装核对、只读验证、adapter 设计和未来实现规划，不表示当前仓库已经具备 live arm 控制能力。
-
-RCM、重力补偿和仿真阅读顺序：先看第 12 章“重力补偿（RESEARCH）”、第 13 章“RCM 控制设计（RESEARCH/PLANNED）”、第 15 章“MuJoCo 与 Sim2Real 计划流程（PLANNED/RESEARCH）”和第 16 章“H0-H9 硬件门控（PLANNED）”。任何 RCM、重力补偿、MIT 单关节、torque、impedance、current 或 low-level motor-control 内容，在 H0-H6 前都不能用于真实机械臂写控制。
-
-状态标签中文名：当前可用（CURRENT）只表示当前仓库文件已经支持的 dry-run、构建、观察或静态检查；计划实现（PLANNED）只表示未来需要落地到源码、launch、测试和审查的工程工作；研究验证（RESEARCH）只表示可用于概念、数学、仿真、证据规划或只读实验，不允许直接驱动 live arm。
-
-## 松灵 / AgileX Piper SDK 详细使用补充（中文）
-
-本补充是 SDK 使用和接入规划清单，不是当前仓库 live arm 控制教程。当前仓库没有 SDK 集成、没有 SDK adapter、没有 CAN adapter、没有 ros2_control hardware interface、没有 `joint_trajectory_controller` wiring，也没有经过验证的 Piper 实机写控制链路；所有 SDK 写控制内容在本文中均属于计划实现（PLANNED）或研究验证（RESEARCH）。
-
-官方来源：松灵 / AgileX Piper SDK 官方仓库为 `https://github.com/agilexrobotics/piper_sdk`。安装、demo、函数名、构造参数、CAN interface 参数、firmware/SDK/API 兼容性和故障排查语义都必须以当前安装版本的官方 README、release notes、demo 目录和源码为准。
-
-### SDK 安装与版本管理
-
-先安装 Python CAN 依赖，再安装 SDK：
-
-```bash
-pip3 install python-can
-pip3 install piper_sdk
-pip3 show piper_sdk
-```
-
-源码安装流程：
-
-```bash
-git clone https://github.com/agilexrobotics/piper_sdk.git
-cd piper_sdk
-pip3 install .
-pip3 show piper_sdk
-```
-
-wheel 安装流程：
-
-```bash
-pip3 install ./piper_sdk-REPLACE_WITH_VERSION-py3-none-any.whl
-pip3 show piper_sdk
-```
-
-常用维护命令：
-
-```bash
-pip3 show piper_sdk
-pip3 uninstall piper_sdk
-pip3 install --upgrade piper_sdk
-```
-
-升级或卸载前必须记录旧版本：`pip3 show piper_sdk` 输出、SDK commit/tag、wheel 文件名、Python 版本、操作系统、CAN adapter 型号、机械臂序列号、firmware version 和测试日期。不要只记录“已安装 SDK”，因为 API 语义、单位、joint order 或 demo 行为变化都可能导致错误运动。
-
-### CAN 依赖与 PC/CAN 只读流程
-
-系统依赖建议先安装 `can-utils`、`ethtool` 和 `iproute2`：
-
-```bash
-sudo apt update
-sudo apt install can-utils ethtool iproute2
-```
-
-PC/CAN 只读流程必须先识别 CAN 设备，再配置 SocketCAN，并只做监听：
-
-```bash
-ip link
-sudo ip link set can0 down
-sudo ip link set can0 type can bitrate REPLACE_WITH_VENDOR_BITRATE
-sudo ip link set can0 up
-ip -details link show can0
-candump -L can0
-```
-
-`can0` 和 bitrate 都是示例值，必须替换为当前机器实际 interface 和当前 Piper 文档或 SDK demo 要求的参数。非官方 CAN 设备不可假设默认参数；官方 README 提到非官方 CAN 设备需要设置 CAN interface 参数，因此 SDK 初始化时必须把 CAN adapter 类型、interface 名称和相关构造参数写入 evidence。
-
-只读流程通过前禁止运行任何 SDK 写控制 demo。`candump -L can0` 只能证明总线上可观察到报文或无报文，不能证明 joint order、单位、限位、零位或写控制安全。
-
-### SDK 初始化与只读状态读取
-
-SDK 初始化必须只读优先。官方 SDK 中可能存在 `C_PiperInterface` 或 `C_PiperInterface_V2` 这类接口名，但本文不把这些函数名写成当前仓库能力；实际代码必须以安装版本 demo/API 为准，并在 evidence 中记录确切 import 路径、构造参数、CAN interface 参数、只读状态读取函数、返回单位和异常行为。
-
-只读 probe 的最小验收内容：SDK 能导入；能打印 SDK 版本或包信息；能绑定实际 CAN interface；能读取状态或明确返回只读失败；失败时保留完整 traceback、CAN 状态、`ip -details link show can0` 输出和 `candump -L can0` 日志。任何 SDK 读取异常都不能用默认零位、上次状态或全零数组替代。
-
-`SendCanMessage(SEND_MESSAGE_FAILED (100017))` 故障排查：先停止 SDK 测试，检查电源、线缆、CAN adapter、interface 名称、bitrate、终端电阻、机械臂状态和 SDK 构造参数；必要时按官方 notes 断电重启机械臂后再试。重试前必须保存失败日志，不能在不明原因下连续发写控制命令。
-
-### SDK Adapter 规划
-
-SDK adapter 的第一阶段只能是 read-only adapter。它应把 SDK 原始状态转换为 ROS 控制层需要的 SI 单位，显式验证 unit conversion、joint order、joint name、方向、零位、限位、timestamp、firmware/SDK/API evidence 和错误码。adapter 必须记录 logs，并在 SDK 异常、CAN 异常、缺字段、过期 timestamp、joint order 未确认或单位不明确时 fail-closed。
-
-adapter 不能让上层 controller 直接调用 `piper_sdk` 原始写函数。上层只能看到稳定的状态结构、明确的错误状态、只读诊断和未来经过审查的 command owner 接口。任何新增 SDK adapter 代码都必须带 unit test、mock SDK、异常路径测试、单位转换测试、joint order 测试和 logs 样例。
-
-### H0-H6 后的 planned 写控制
-
-H0-H6 通过后才允许规划 SDK 写控制。写控制必须只有 single command owner，不能让 joystick、RCM solver、MoveIt bridge、MuJoCo bridge 或脚本同时拥有 actuator。command owner 必须要求 lifecycle active、fresh timestamp、watchdog heartbeat、limit clamp、joint-order evidence、unit evidence、firmware/SDK/API evidence 和 operator enable。
-
-写控制 wrapper 必须在 stale command、limit violation、SDK error、CAN error、watchdog timeout、lifecycle inactive、timestamp 过期或 command owner 冲突时进入 `HOLD` 或 `FAULT`。恢复只能通过显式 operator action 和新的 evidence 记录完成，不能自动恢复持续运动。
-
-MIT 单关节控制是高级危险功能，误用可能损坏机械臂。H0-H6 前禁用 MIT 单关节、torque、impedance、current、gain-level、low-level motor-control 和任何绕过上层限位的直接电机命令。即使 H0-H6 后评估 MIT 单关节，也必须一次只允许一个关节、低速、短时、限幅、有人值守、e-stop 就绪，并先在 mock/HIL 中通过。
-
-### 禁止事项清单
-
-禁止把本文 PLANNED/RESEARCH 示例复制到上电机械臂环境直接运行。禁止把 `/rcm_cmd`、joystick intent、MoveIt 目标、MuJoCo 输出或 RCM solver 输出直接接到 SDK 写函数。禁止在 H0-H6 前发送 SDK 写控制。禁止在 CAN 只读反馈不可解释时发命令。禁止在 joint order、单位、零位、方向、限位、firmware/SDK/API 证据不完整时 command enable。禁止把 SDK 错误吞掉后继续运动。禁止在 watchdog 未实测时做持续运动。禁止把 `C_PiperInterface`、`C_PiperInterface_V2` 或任何 demo 函数名当成当前仓库已实现能力。禁止把非官方 CAN 设备当成默认官方设备使用。禁止用默认零位或硬编码全零状态掩盖 SDK 读取失败。
+| `rcm_teleop` | `CURRENT` dry-run | typed intent、deadman、timeout 测试 | 不允许 |
+| `agx_arm_description` | `CURRENT` 源文件 / `PLANNED` 显示完善 | install、display launch、tool frames | 不允许 |
+| `rcm_msgs` | `PLANNED` | 新增接口包并冻结字段 | 不允许 |
+| `agx_arm_controller` | `CURRENT` 骨架 / `PLANNED` 控制器 | C++ 数学库、重力补偿、状态机、mock launch | 不直接写硬件 |
+| `agx_arm_moveit_config` | `PLANNED` | fake plan、planning scene | 不允许 |
+| `agx_arm_sim` | `PLANNED` | `/sim` replay、MuJoCo 只读同步 | 不允许 |
+| `agx_arm_hw_interface` | `PLANNED` | read-only adapter，后续 command owner | H0-H6 前不允许 |
+| `agx_arm_bringup` | `CURRENT` 骨架 / `PLANNED` launch 编排 | 分阶段 launch、安全默认值 | 只有 live_low_energy 且 H gate 通过 |
+| `scripts/` | `PLANNED` | CAN/SDK 只读和证据脚本 | 不允许持续控制 |
+
+---
+
+## 附录 C：术语和禁止事项
+
+### C.1 术语
+
+| 术语 | 含义 |
+| --- | --- |
+| RCM | 工具轴线穿过固定远心点的约束 |
+| pivot | RCM 固定点 |
+| tool axis | 工具功能轴线，不一定等于外形中心线 |
+| insertion | 沿工具轴线插入或退出 |
+| roll | 绕工具轴线旋转 |
+| gravity compensation | 根据关节角、重力方向和工具载荷估计抵消重力的关节力矩 |
+| command owner | 唯一拥有真实硬件写控制权的节点 |
+| fail-closed | 不可信或失败时停止输出危险命令 |
+| reason code | 可检索、可测试的故障原因字符串 |
+
+### C.2 禁止事项
+
+- 禁止 rcm_teleop、MoveIt、MuJoCo、测试脚本直接调用 SDK 写控制。
+- 禁止多个节点同时拥有真实硬件写命令权。
+- 禁止 SDK/CAN 读取失败后发布默认零位或全零假反馈。
+- 禁止 solver 失败后沿用上一条非零命令。
+- 禁止用普通 TCP pose 控制宣称满足 RCM。
+- 禁止逐关节硬裁剪后继续宣称 RCM 等式满足。
+- 禁止仿真成功后跳过 CAN/SDK 只读和 H gate。
+- 禁止 live launch 默认开启写控制。
+- 禁止把 `GRAVITY_COMP` 字符串或位置保持模式当作已验证重力补偿。
+- 禁止在未确认硬件 torque/current/gravity 接口前，把 `tau_g` 输出写入真实机械臂。
+
+### C.3 参考资料
+
+- ROS 2 Interfaces: `https://docs.ros.org/en/ros2_documentation/rolling/Concepts/Basic/Interfaces-Topics-Services-Actions.html`
+- ROS 2 `rclcpp`: `https://docs.ros.org/en/rolling/p/rclcpp/`
+- ROS 2 `rclpy`: `https://docs.ros.org/en/ros2_packages/iron/api/rclpy/index.html`
+- `ros2_control`: `https://control.ros.org/master/doc/ros2_control/doc/index.html`
+- MoveIt 2: `https://moveit.picknik.ai/`
